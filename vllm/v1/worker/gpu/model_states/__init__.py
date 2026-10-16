@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention, CrossAttention
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -49,7 +50,10 @@ def resolve_model_state_cls(
 
         return EncoderOnlyModelState
 
-    if vllm_config.model_config.is_hybrid or vllm_config.model_config.is_attention_free:
+    # Hybrid PP stages can contain only full attention, or no decoder layers.
+    if (
+        vllm_config.model_config.is_hybrid or vllm_config.model_config.is_attention_free
+    ) and any(isinstance(layer, MambaBase) for layer in model.modules()):
         from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
         return MambaHybridModelState

@@ -15,14 +15,110 @@ from tests.v1.attention.test_gdn_metadata_builder import (
 )
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.platforms import current_platform
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
     RecoverSSMPostprocessMetadata,
 )
-from vllm.v1.worker.gpu.model_states import mamba_hybrid
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+)
+from vllm.v1.worker.gpu.model_states import init_model_state, mamba_hybrid
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
+
+
+class _LocalGDNLayer(torch.nn.Module, MambaBase):
+    @property
+    def mamba_type(self):
+        return MambaAttentionBackendEnum.GDN_ATTN
+
+    def get_state_shape(self):
+        return ((2, 4), (4, 4))
+
+    def get_state_dtype(self):
+        return (torch.float32, torch.float32)
+
+
+@pytest.mark.parametrize(
+    "local_layers", [(), ("attention",), ("gdn",), ("attention", "gdn")]
+)
+def test_hybrid_pp_stage_only_initializes_its_local_model_state(local_layers):
+    """A globally hybrid model may have no recurrent state on a PP stage."""
+    model = torch.nn.Sequential()
+    for name in local_layers:
+        if name == "gdn":
+            layer = _LocalGDNLayer()
+        else:
+            # Only state selection is under test; no attention kernel is needed.
+            layer = Attention.__new__(Attention)
+            torch.nn.Module.__init__(layer)
+            layer.attn_type = AttentionType.DECODER
+        model.add_module(name, layer)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_hybrid=True,
+            is_attention_free=False,
+            enable_prompt_embeds=False,
+            uses_mrope=False,
+            max_model_len=64,
+            dtype=torch.float32,
+            get_inputs_embeds_size=lambda: 4,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=8),
+        cache_config=SimpleNamespace(
+            mamba_cache_mode="align", use_kda_recoverssm=False
+        ),
+        compilation_config=SimpleNamespace(
+            static_forward_context=dict(model.named_children())
+        ),
+    )
+    state = init_model_state(config, model, None, torch.device("cpu"))
+    # The worker keeps the engine's group numbering even when it has no layers
+    # for one group. Global align mode must not attempt a local Mamba copy.
+    cache = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attention"] if "attention" in local_layers else [],
+                FullAttentionSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=4,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["gdn"] if "gdn" in local_layers else [],
+                MambaSpec(
+                    block_size=16,
+                    shapes=((2, 4), (4, 4)),
+                    dtypes=(torch.float32, torch.float32),
+                    mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    if "gdn" in local_layers:
+        assert isinstance(state, MambaHybridModelState)
+        assert state._align_mode
+        assert state._get_mamba_group_info(cache)[0] == [1]
+        return
+
+    assert type(state) is DefaultModelState
+    state.initialize_kv_cache(cache, Mock())
+    state.preprocess_state(Mock(), (), cache, torch.tensor([16]))
+    state.postprocess_state(torch.tensor([0]), torch.tensor([1]))
 
 
 def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> None:

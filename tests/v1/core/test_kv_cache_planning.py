@@ -49,6 +49,7 @@ from vllm.v1.kv_cache_interface import (
     HiSparseHotSpec,
     HiSparseResidentSpec,
     KVCacheConfig,
+    KVCacheGroupRole,
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
@@ -1307,6 +1308,194 @@ def test_empty_pp_stage_keeps_minimum_of_nonempty_stages():
     assert configs[0].kv_cache_tensors == []
     assert configs[1].kv_cache_tensors[0].size == 12 * spec.page_size_bytes
     assert configs[2].kv_cache_tensors[0].size == 6 * spec.page_size_bytes
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("layer_counts", [(1, 6, 1), (0, 8, 0), (3, 1, 4)])
+def test_hybrid_pp_preserves_global_groups_and_allocates_only_local_layers(
+    packed, layer_counts
+):
+    """Qwen3.5-shaped stages may own only GDN, only attention, or no layers."""
+    from vllm.v1.worker.utils import allocate_kv_cache, prepare_kernel_block_sizes
+
+    cache_config = CacheConfig(mamba_cache_mode="align")
+    cache_config.kv_cache_layout = "BLHNC" if packed else "LBNHC"
+    config = SimpleNamespace(
+        cache_config=cache_config,
+        attention_config=SimpleNamespace(hisparse_config=None),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=None,
+        num_prefill_lookahead_tokens=0,
+        model_config=SimpleNamespace(original_max_model_len=64, max_model_len=64),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, decode_context_parallel_size=1
+        ),
+    )
+    specs = {
+        f"layers.{i}": (
+            new_kv_cache_spec(head_size=32 if packed else 64)
+            if i % 4 == 3
+            else new_mamba_spec(mamba_cache_mode="align", num_speculative_blocks=0)
+        )
+        for i in range(8)
+    }
+    global_groups = get_kv_cache_groups(config, specs.copy())
+    assert (
+        any(
+            isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            for group in global_groups
+        )
+        == packed
+    )
+    worker_specs = []
+    start = 0
+    for count in layer_counts:
+        worker_specs.append(
+            {f"layers.{i}": specs[f"layers.{i}"] for i in range(start, start + count)}
+        )
+        start += count
+    memory = [
+        32
+        * max(
+            sum(
+                specs[name].page_size_bytes
+                for name in group.layer_names
+                if name in local
+            )
+            for group in global_groups
+        )
+        for local in worker_specs
+    ]
+
+    configs = get_kv_cache_configs(config, worker_specs, memory)
+
+    assert [worker.num_blocks for worker in configs] == [32] * 3
+    for worker, local in zip(configs, worker_specs):
+        assert len(worker.kv_cache_groups) == len(global_groups)
+        assert {
+            name for tensor in worker.kv_cache_tensors for name in tensor.layers
+        } == set(local)
+        for local_group, global_group in zip(worker.kv_cache_groups, global_groups):
+            assert local_group.layer_names == [
+                name for name in global_group.layer_names if name in local
+            ]
+            # Empty local groups must still describe their global block table.
+            if isinstance(local_group.kv_cache_spec, UniformTypeKVCacheSpecs):
+                assert local_group.kv_cache_spec.kv_cache_specs
+            assert (
+                local_group.kv_cache_spec.block_size
+                == global_group.kv_cache_spec.block_size
+            )
+        kernel_blocks = prepare_kernel_block_sizes(worker, [[] for _ in global_groups])
+        assert len(kernel_blocks) == len(global_groups)
+        assert set(
+            allocate_kv_cache(
+                worker,
+                torch.device("cpu"),
+                KVCacheLayout[cache_config.kv_cache_layout],
+                kernel_blocks,
+            )
+        ) == set(local)
+
+    scheduler = generate_scheduler_kv_cache_config(configs)
+    assert len(scheduler.kv_cache_groups) == len(global_groups)
+    for group_id, group in enumerate(scheduler.kv_cache_groups):
+        assert group.layer_names
+        assert set(group.layer_names) <= set(global_groups[group_id].layer_names)
+        assert not isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+    for rank, local in enumerate(worker_specs):
+        if local and all(
+            isinstance(spec, FullAttentionSpec) for spec in local.values()
+        ):
+            # Four usable blocks fit this rank's attention alone, but the shared
+            # pool must also reserve block IDs for GDN groups on other ranks.
+            constrained_memory = memory.copy()
+            constrained_memory[rank] = 5 * next(iter(local.values())).page_size_bytes
+            with pytest.raises(ValueError, match="max seq len"):
+                get_kv_cache_configs(config, worker_specs, constrained_memory)
+
+
+def test_pp_projection_and_scheduler_preserve_global_group_metadata():
+    linear = new_mamba_spec(num_speculative_blocks=0)
+    attention = new_kv_cache_spec()
+    global_groups = [
+        KVCacheGroupSpec(["linear"], linear),
+        KVCacheGroupSpec(
+            ["attention"],
+            attention,
+            is_eagle_group=True,
+            host_resident=True,
+            enable_kv_transfer=False,
+            role=KVCacheGroupRole.HISPARSE_SOURCE,
+        ),
+    ]
+    worker_groups = [
+        kv_cache_planning._project_kv_cache_groups_to_worker(global_groups, local)
+        for local in ({}, {"linear": linear}, {"attention": attention})
+    ]
+    for groups in worker_groups:
+        assert groups[1].host_resident
+        assert not groups[1].enable_kv_transfer
+        assert groups[1].role == KVCacheGroupRole.HISPARSE_SOURCE
+    tensor = KVCacheTensor(
+        size=16 * linear.page_size_bytes,
+        layers=["linear"],
+        layer_stride=16 * linear.page_size_bytes,
+        block_stride=linear.page_size_bytes,
+    )
+    configs = [
+        KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=[tensor] if i == 1 else [],
+            kv_cache_groups=groups,
+            hisparse_host_num_blocks=16,
+            kv_tp_replicas=4 if i < 2 else 2,
+        )
+        for i, groups in enumerate(worker_groups)
+    ]
+
+    scheduler = generate_scheduler_kv_cache_config(configs)
+
+    assert [group.layer_names for group in scheduler.kv_cache_groups] == [
+        ["linear"],
+        ["attention"],
+    ]
+    assert scheduler.kv_cache_groups[1].is_eagle_group
+    assert scheduler.kv_cache_groups[1].host_resident
+    assert not scheduler.kv_cache_groups[1].enable_kv_transfer
+    assert scheduler.kv_cache_groups[1].role == KVCacheGroupRole.HISPARSE_SOURCE
+    assert scheduler.kv_cache_tensors == [tensor]
+    assert scheduler.kv_tp_replicas == 2
+    assert worker_groups[1][1].layer_names == []
+    assert not worker_groups[1][1].is_eagle_group
+
+
+def test_pp_kv_replication_is_resolved_before_projecting_mixed_attention_group():
+    cache_config = CacheConfig()
+    cache_config.kv_cache_layout = "LBNHC"
+    config = SimpleNamespace(
+        cache_config=cache_config,
+        attention_config=SimpleNamespace(hisparse_config=None),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=None,
+        num_prefill_lookahead_tokens=0,
+        model_config=SimpleNamespace(original_max_model_len=16, max_model_len=16),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=4, decode_context_parallel_size=1
+        ),
+    )
+    mla = new_mla_spec()
+    gqa = replace(new_kv_cache_spec(), max_tp_shards=4)
+    configs = get_kv_cache_configs(
+        config,
+        [{}, {"mla": mla}, {"gqa": gqa}],
+        [0, 16 * mla.page_size_bytes, 16 * gqa.page_size_bytes],
+    )
+
+    # The first nonempty stage alone has four replicas, but the model's GQA
+    # stage is sharded, so no two TP workers hold identical KV for every layer.
+    assert [worker.kv_tp_replicas for worker in configs] == [1, 1, 1]
+    assert generate_scheduler_kv_cache_config(configs).kv_tp_replicas == 1
 
 
 def test_packed_groups_glm5_like_hybrid():

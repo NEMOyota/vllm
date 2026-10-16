@@ -1,0 +1,29 @@
+# Use a non-MoE Qwen3.5 checkpoint and replace the Ray node addresses.
+# Launch with VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1 VLLM_USE_V2_MODEL_RUNNER=1.
+model: /path/to/local/Qwen3.5
+served-model-name: qwen3.5-head-tail
+model-impl: vllm
+language-model-only: true
+tensor-parallel-size: 1
+pipeline-parallel-size: 3
+distributed-executor-backend: ray
+enforce-eager: true
+data-parallel-size: 1
+prefill-context-parallel-size: 1
+decode-context-parallel-size: 1
+max-model-len: 8192
+max-num-seqs: 8
+max-num-batched-tokens: 512
+enable-chunked-prefill: true
+pipeline-partition-config:
+  head_layers: 0
+  tail_layers: 0
+  stage_node_ips:
+    - "10.0.0.10"
+    - "10.0.0.20"
+    - "10.0.0.10"
+pipeline-transport-config:
+  enabled: true
+  max_inflight_sends: 2
+  max_inflight_bytes: 268435456
+  async_receive: true

@@ -4,8 +4,9 @@
 import math
 from bisect import bisect_left
 from itertools import accumulate
+from typing import Self
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from vllm.config.utils import config
 
@@ -92,6 +93,11 @@ class PipelinePartitionConfig:
     """
     layer_costs: list[float] | None = None
     """Positive relative cost of each transformer layer in model order."""
+    layer_type_costs: dict[str, float] | None = None
+    """Profiled relative costs keyed by the model's HF layer_types values.
+
+    Expanded in model layer order. Mutually exclusive with layer_costs.
+    """
     stage_node_ips: list[str] | None = None
     """Optional placement addresses, one per stage; addresses may repeat."""
 
@@ -109,6 +115,30 @@ class PipelinePartitionConfig:
             )
         return values
 
+    @field_validator("layer_type_costs")
+    @classmethod
+    def _validate_type_costs(
+        cls, values: dict[str, float] | None
+    ) -> dict[str, float] | None:
+        if values is not None and (
+            not values
+            or any(
+                not name.strip() or not math.isfinite(cost) or cost <= 0
+                for name, cost in values.items()
+            )
+        ):
+            raise ValueError("Layer type costs must be nonempty, finite and positive")
+        return values
+
+    @model_validator(mode="after")
+    def _validate_cost_source(self) -> Self:
+        self._check_cost_source()
+        return self
+
+    def _check_cost_source(self) -> None:
+        if self.layer_costs is not None and self.layer_type_costs is not None:
+            raise ValueError("Use layer_costs or layer_type_costs, not both")
+
     @field_validator("stage_node_ips")
     @classmethod
     def _validate_node_ips(cls, values: list[str] | None) -> list[str] | None:
@@ -118,7 +148,13 @@ class PipelinePartitionConfig:
             raise ValueError("stage_node_ips must contain nonempty addresses")
         return values
 
-    def resolve(self, num_hidden_layers: int, pp_size: int) -> list[int]:
+    def resolve(
+        self,
+        num_hidden_layers: int,
+        pp_size: int,
+        *,
+        layer_types: list[str] | None = None,
+    ) -> list[int]:
         """Return per-stage counts covering all layers exactly once.
 
         Fixed endpoints require at least three stages. Insufficient layers for
@@ -141,6 +177,22 @@ class PipelinePartitionConfig:
                 raise ValueError(f"{name} must have {pp_size} entries")
         if self.layer_costs is not None and len(self.layer_costs) != num_hidden_layers:
             raise ValueError(f"layer_costs must have {num_hidden_layers} entries")
+        self._check_cost_source()
+        costs = self.layer_costs
+        if self.layer_type_costs is not None:
+            if layer_types is None or len(layer_types) != num_hidden_layers:
+                raise ValueError(
+                    "layer_type_costs requires model layer_types with one entry "
+                    "per transformer layer"
+                )
+            missing = set(layer_types) - self.layer_type_costs.keys()
+            unused = self.layer_type_costs.keys() - set(layer_types)
+            if missing or unused:
+                raise ValueError(
+                    "layer_type_costs must match model layer_types: "
+                    f"missing={sorted(missing)}, unused={sorted(unused)}"
+                )
+            costs = [self.layer_type_costs[layer_type] for layer_type in layer_types]
 
         weights = self.stage_compute_weights or [1.0] * pp_size
         fixed_endpoints = self.head_layers is not None or self.tail_layers is not None
@@ -156,12 +208,10 @@ class PipelinePartitionConfig:
         remaining = num_hidden_layers - head - tail
         if remaining < len(weights):
             raise ValueError("Each unfixed pipeline stage must have at least one layer")
-        if self.layer_costs is None:
+        if costs is None:
             counts = _weighted_layer_counts(remaining, weights)
         else:
-            counts = _cost_layer_counts(
-                self.layer_costs[head : num_hidden_layers - tail], weights
-            )
+            counts = _cost_layer_counts(costs[head : num_hidden_layers - tail], weights)
         return [head, *counts, tail] if fixed_endpoints else counts
 
 

@@ -655,6 +655,10 @@ def get_kv_cache_config_from_groups(
 
     kv_cache_tensors = []
     for group in kv_cache_groups:
+        if not group.layer_names:
+            # Empty PP groups retain a global spec for logical block tables,
+            # but none of those layers has physical storage on this worker.
+            continue
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
@@ -1475,9 +1479,10 @@ def _project_kv_cache_groups_to_worker(
                 },
             )
         projected_groups.append(
-            KVCacheGroupSpec(
-                worker_layer_names,
-                group_spec,
+            replace(
+                group,
+                layer_names=worker_layer_names,
+                kv_cache_spec=group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
             )
         )
@@ -1641,11 +1646,12 @@ def get_kv_cache_configs(
             min_num_blocks * _pool_bytes_per_block(vllm_config, groups),
         )
 
+    kv_tp_replicas = kv_cache_groups_tp_replicas(
+        global_kv_cache_groups,
+        vllm_config.parallel_config.tensor_parallel_size,
+        vllm_config.parallel_config.decode_context_parallel_size,
+    )
     for kv_cache_config in kv_cache_configs:
-        kv_cache_config.kv_tp_replicas = kv_cache_groups_tp_replicas(
-            kv_cache_config.kv_cache_groups,
-            vllm_config.parallel_config.tensor_parallel_size,
-            vllm_config.parallel_config.decode_context_parallel_size,
-        )
+        kv_cache_config.kv_tp_replicas = kv_tp_replicas
 
     return kv_cache_configs

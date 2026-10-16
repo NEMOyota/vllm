@@ -201,6 +201,7 @@ steps:
     - vllm/engine/
     - vllm/inputs/
     - vllm/lora/
+    - vllm/model_executor/models/
     - vllm/multimodal/
     - vllm/outputs.py
     - vllm/platforms/
@@ -214,6 +215,7 @@ steps:
     - tests/v1
     - tests/watermarking
     - tests/distributed/test_pp_transport.py
+    - tests/models/test_utils.py
   device: cpu-small
   commands:
     # split the test to avoid interference
@@ -227,6 +229,10 @@ steps:
     - pytest -v -s -m 'cpu_test' v1/metrics
     - pytest -v -s watermarking
     - pytest -v -s distributed/test_pp_transport.py
+    - pytest -v -s models/test_utils.py::test_dense_pp_endpoints_match_unsplit_model
+    - pytest -v -s v1/worker/test_gpu_model_runner.py::test_mamba_align_postprocess_uses_only_local_layers
+    - pytest -v -s v1/worker/test_gpu_model_runner_v2.py::test_gather_batch_req_state_has_consistent_pp_order
+    - pytest -v -s v1/worker/test_mamba_hybrid_model_state.py::test_hybrid_pp_stage_only_initializes_its_local_model_state
 
 - label: ":nvidia: (H200 MIG 18GB) Extract Hidden States Integration"
   key: extract-hidden-states-integration

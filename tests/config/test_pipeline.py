@@ -100,6 +100,57 @@ def test_layer_cost_planning_excludes_fixed_endpoint_costs():
     assert partition.resolve(11, 4) == [2, 1, 7, 1]
 
 
+@pytest.mark.parametrize("fixed_endpoints", [False, True])
+def test_layer_type_costs_match_explicit_per_layer_profile(fixed_endpoints):
+    """Hybrid planning must preserve the checkpoint's actual layer order."""
+    layer_types = ["linear_attention"] * 3 + ["full_attention"]
+    layer_types *= 4
+    type_costs = {"linear_attention": 1.0, "full_attention": 4.0}
+    kwargs = {"head_layers": 1, "tail_layers": 1} if fixed_endpoints else {}
+    by_type = PipelinePartitionConfig(
+        **kwargs, layer_type_costs=type_costs, stage_compute_weights=[1, 2, 3, 1]
+    )
+    by_layer = PipelinePartitionConfig(
+        **kwargs,
+        layer_costs=[type_costs[name] for name in layer_types],
+        stage_compute_weights=[1, 2, 3, 1],
+    )
+
+    assert by_type.resolve(16, 4, layer_types=layer_types) == by_layer.resolve(16, 4)
+    assert by_type.layer_costs is None  # Resolution must not mutate the config.
+    assert by_type.layer_type_costs == type_costs
+
+
+@pytest.mark.parametrize(
+    "costs", [{}, {"": 1}, {"linear_attention": 0}, {"linear_attention": float("inf")}]
+)
+def test_invalid_layer_type_profiles_are_rejected(costs):
+    with pytest.raises(ValueError, match="nonempty, finite and positive"):
+        PipelinePartitionConfig(layer_type_costs=costs)
+
+
+def test_layer_type_and_per_layer_costs_cannot_be_combined():
+    with pytest.raises(ValueError, match="not both"):
+        PipelinePartitionConfig(layer_costs=[1], layer_type_costs={"full_attention": 1})
+
+
+@pytest.mark.parametrize("layer_types", [None, ["linear_attention"]])
+def test_type_profile_requires_complete_model_layer_types(layer_types):
+    partition = PipelinePartitionConfig(layer_type_costs={"linear_attention": 1})
+    with pytest.raises(ValueError, match="one entry per transformer layer"):
+        partition.resolve(8, 3, layer_types=layer_types)
+
+
+@pytest.mark.parametrize(
+    "costs",
+    [{"linear_attention": 1}, {"linear_attention": 1, "full_attention": 4, "typo": 1}],
+)
+def test_type_profile_rejects_missing_and_unused_types(costs):
+    partition = PipelinePartitionConfig(layer_type_costs=costs)
+    with pytest.raises(ValueError, match="must match model layer_types"):
+        partition.resolve(4, 2, layer_types=["linear_attention", "full_attention"] * 2)
+
+
 def test_repeated_placement_addresses_do_not_change_plan_or_input():
     addresses = ["192.0.2.1", "192.0.2.2", "192.0.2.1"]
     partition = PipelinePartitionConfig(

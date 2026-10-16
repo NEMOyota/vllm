@@ -693,7 +693,10 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
 
     @property
     def use_sequence_parallel(self) -> bool:
-        return self.layers[self.start_layer].use_attn_reduce_scatter_for_moe
+        return (
+            self.start_layer < self.end_layer
+            and self.layers[self.start_layer].use_attn_reduce_scatter_for_moe
+        )
 
     def forward(
         self,
@@ -733,6 +736,9 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
+            if residual is None:
+                # Embedding-only PP stages must return tensor-only intermediates.
+                residual = torch.zeros_like(hidden_states)
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )

@@ -132,6 +132,7 @@ def get_pp_indices(
     pp_size: int,
     *,
     partition_config: "PipelinePartitionConfig | None" = None,
+    layer_types: list[str] | None = None,
 ) -> tuple[int, int]:
     """Try to evenly distribute layers across partitions.
 
@@ -154,7 +155,9 @@ def get_pp_indices(
             raise ValueError(
                 "Use pipeline_partition_config or VLLM_PP_LAYER_PARTITION, not both."
             )
-        partitions = partition_config.resolve(num_hidden_layers, pp_size)
+        partitions = partition_config.resolve(
+            num_hidden_layers, pp_size, layer_types=layer_types
+        )
     elif partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]

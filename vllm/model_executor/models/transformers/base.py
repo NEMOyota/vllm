@@ -425,6 +425,7 @@ class Base(
             self.pp_group.rank_in_group,
             self.pp_group.world_size,
             partition_config=self.parallel_config.pipeline_partition_config,
+            layer_types=getattr(self.text_config, "layer_types", None),
         )
         layers_name = names[module_list_idx]
         # attrgetter in case the module is nested (e.g. "text_model.layers")
@@ -615,6 +616,7 @@ class Base(
             pp_rank,
             pp_size,
             partition_config=self.parallel_config.pipeline_partition_config,
+            layer_types=layer_types,
         )
 
         for i in range(start, end):

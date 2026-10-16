@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -25,6 +26,57 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
 from vllm.v1.worker.gpu.spec_decode.standalone_ar import speculator as ar_module
 from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    "slot_order",
+    [
+        ("prefill", "decode", "extend"),
+        ("extend", "prefill", "decode"),
+        ("decode", "extend", "prefill"),
+    ],
+)
+def test_gather_batch_req_state_has_consistent_pp_order(slot_order):
+    """PP stages must agree on batch order despite different local request slots."""
+    # Per-request prompt length, computed prompt tokens, and maximum sequence length.
+    states = {"prefill": (5, 0, 13), "decode": (3, 3, 10), "extend": (7, 6, 12)}
+    prefill_len, computed, max_seq_len = np.array(
+        [states[req_id] for req_id in slot_order], dtype=np.int32
+    ).T
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.decode_query_len = 1
+    runner.use_pp = True
+    runner.pcp_manager = None
+    runner.req_states = SimpleNamespace(
+        req_id_to_index={req_id: i for i, req_id in enumerate(slot_order)},
+        prefill_len=SimpleNamespace(np=prefill_len),
+        num_computed_prefill_tokens=computed,
+        max_seq_len=max_seq_len,
+    )
+    scheduler = SimpleNamespace(
+        num_scheduled_tokens={"prefill": 4, "decode": 1, "extend": 1},
+        total_num_scheduled_tokens=6,
+        scheduled_spec_decode_tokens={},
+    )
+
+    batch, uniform_token_count = runner.gather_batch_req_state(
+        scheduler, dummy_run=False
+    )
+
+    assert batch is not None
+    assert batch.req_ids == ["decode", "extend", "prefill"]
+    assert batch.idx_mapping_np.tolist() == [
+        slot_order.index(req_id) for req_id in ["decode", "extend", "prefill"]
+    ]
+    assert batch.num_scheduled_tokens.tolist() == [1, 1, 4]
+    assert batch.prefill_len_np.tolist() == [3, 7, 5]
+    assert batch.num_computed_prefill_tokens_np.tolist() == [3, 6, 0]
+    assert batch.max_seq_len_np.tolist() == [10, 12, 13]
+    assert batch.is_prefilling_np.tolist() == [False, True, True]
+    assert batch.prefill_runs_as_decode_np.tolist() == [False, True, False]
+    assert batch.has_prefill and not batch.decode_graph_eligible
+    assert uniform_token_count is None
 
 
 def test_non_last_pp_rank_uses_global_batch_for_sample_feedback():

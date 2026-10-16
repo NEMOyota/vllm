@@ -3,22 +3,33 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
-from transformers import LlamaConfig
+import torch
+from transformers import LlamaConfig, Qwen3_5Config, Qwen3_5TextConfig
 
 from vllm.config import (
     ParallelConfig,
     PipelinePartitionConfig,
     PipelineTransportConfig,
     VllmConfig,
+    set_current_vllm_config,
 )
 from vllm.distributed.utils import get_pp_indices
 from vllm.engine.arg_utils import EngineArgs
+from vllm.model_executor.models.utils import PPMissingLayer, make_layers
 from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 pytestmark = pytest.mark.skip_global_cleanup
+
+
+@pytest.fixture(autouse=True)
+def v2_runner(monkeypatch):
+    # Exercise config validation without starting the GPU runner or its kernels.
+    monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
 
 
 @pytest.fixture
@@ -267,6 +278,7 @@ def test_pipeline_rejects_implicitly_created_kv_offload_connector(
 def test_zero_endpoint_validation_rejects_unsupported_model_paths(overrides, match):
     model = SimpleNamespace(
         get_total_num_hidden_layers=lambda: 12,
+        hf_text_config=SimpleNamespace(),
         architecture="LlamaForCausalLM",
         model_impl="vllm",
         runner_type="generate",
@@ -279,6 +291,7 @@ def test_zero_endpoint_validation_rejects_unsupported_model_paths(overrides, mat
         setattr(model, key, value)
     config = SimpleNamespace(
         model_config=model,
+        use_v2_model_runner=True,
         speculative_config=None,
         parallel_config=SimpleNamespace(
             pipeline_partition_config=PipelinePartitionConfig(head_layers=0),
@@ -288,3 +301,159 @@ def test_zero_endpoint_validation_rejects_unsupported_model_paths(overrides, mat
     )
     with pytest.raises(ValueError, match=match):
         VllmConfig._resolve_pipeline_partition(config)
+
+
+@pytest.fixture(params=[False, True], ids=["causal_lm", "conditional_language_only"])
+def tiny_qwen35_model(tmp_path, request):
+    text_config = Qwen3_5TextConfig(
+        architectures=["Qwen3_5ForCausalLM"],
+        num_hidden_layers=8,
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        vocab_size=128,
+        max_position_embeddings=128,
+        layer_types=["linear_attention"] * 3
+        + ["full_attention"]
+        + ["linear_attention"] * 3
+        + ["full_attention"],
+    )
+    config = (
+        Qwen3_5Config(
+            text_config=text_config.to_dict(),
+            architectures=["Qwen3_5ForConditionalGeneration"],
+        )
+        if request.param
+        else text_config
+    )
+    config.save_pretrained(tmp_path)
+    return str(tmp_path), request.param
+
+
+@pytest.mark.parametrize(
+    "partition,expected",
+    [
+        ({"head_layers": 0, "tail_layers": 0}, [(0, 0), (0, 8), (8, 8)]),
+        ({"head_layers": 3, "tail_layers": 1}, [(0, 3), (3, 7), (7, 8)]),
+        (
+            {
+                "stage_compute_weights": [1, 4, 1],
+                "layer_type_costs": {"linear_attention": 1, "full_attention": 4},
+            },
+            [(0, 2), (2, 7), (7, 8)],
+        ),
+    ],
+)
+def test_qwen35_hybrid_cli_resolves_partition_and_local_state_layers(
+    tiny_qwen35_model, partition, expected
+):
+    """A GDN-only stage and an attention-only stage size different cache types."""
+    path, language_model_only = tiny_qwen35_model
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    argv = [
+        "--model",
+        path,
+        "--skip-tokenizer-init",
+        "--enforce-eager",
+        "--distributed-executor-backend",
+        "mp",
+        "--pipeline-parallel-size",
+        "3",
+        "--pipeline-partition-config",
+        json.dumps(partition),
+        "--max-model-len",
+        "128",
+        "--max-num-batched-tokens",
+        "128",
+        "--max-num-seqs",
+        "4",
+    ]
+    if language_model_only:
+        argv.append("--language-model-only")
+    config = EngineArgs.from_cli_args(parser.parse_args(argv)).create_engine_config()
+    model = config.model_config
+    assert model.is_hybrid
+    assert not model.is_moe
+    for rank, bounds in enumerate(expected):
+        config.parallel_config.rank = rank
+        assert model.get_layers_start_end_indices(config.parallel_config) == bounds
+        local_types = model.hf_text_config.layer_types[bounds[0] : bounds[1]]
+        assert model.get_num_layers_by_block_type(config.parallel_config) == (
+            local_types.count("full_attention")
+        )
+        assert model.get_num_layers_by_block_type(
+            config.parallel_config, "linear_attention"
+        ) == local_types.count("linear_attention")
+        # Construction must use the same hybrid cost profile as cache sizing.
+        with (
+            set_current_vllm_config(config),
+            patch(
+                "vllm.distributed.parallel_state.get_pp_group",
+                return_value=SimpleNamespace(rank_in_group=rank, world_size=3),
+            ),
+        ):
+            start, end, layers = make_layers(
+                8, lambda prefix: torch.nn.Identity(), prefix="model.layers"
+            )
+        assert (start, end) == bounds
+        assert [
+            index
+            for index, layer in enumerate(layers)
+            if not isinstance(layer, PPMissingLayer)
+        ] == list(range(*bounds))
+
+
+@pytest.mark.parametrize("tiny_qwen35_model", [True], indirect=True)
+def test_qwen35_zero_endpoints_reject_visual_inputs(tiny_qwen35_model):
+    path, conditional = tiny_qwen35_model
+    assert conditional
+    with pytest.raises(ValueError, match="language-model-only"):
+        EngineArgs(
+            model=path,
+            skip_tokenizer_init=True,
+            enforce_eager=True,
+            pipeline_parallel_size=3,
+            distributed_executor_backend="mp",
+            pipeline_partition_config={"head_layers": 0, "tail_layers": 0},
+            max_model_len=128,
+        ).create_engine_config()
+
+
+@pytest.mark.parametrize(
+    "partition", [{"head_layers": 0}, {"head_layers": 3, "tail_layers": 1}]
+)
+def test_hybrid_partition_rejects_v1_runner(tiny_qwen35_model, monkeypatch, partition):
+    path, language_model_only = tiny_qwen35_model
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    with pytest.raises(ValueError, match="consistent request ordering"):
+        EngineArgs(
+            model=path,
+            skip_tokenizer_init=True,
+            enforce_eager=True,
+            language_model_only=language_model_only,
+            pipeline_parallel_size=3,
+            distributed_executor_backend="mp",
+            pipeline_partition_config=partition,
+            max_model_len=128,
+        ).create_engine_config()
+
+
+def test_dense_zero_endpoint_rejects_v1_runner(tiny_model, monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    with pytest.raises(ValueError, match="consistent request ordering"):
+        EngineArgs(
+            model=tiny_model,
+            skip_tokenizer_init=True,
+            enforce_eager=True,
+            pipeline_parallel_size=3,
+            distributed_executor_backend="mp",
+            pipeline_partition_config={"head_layers": 0},
+            max_model_len=32,
+        ).create_engine_config()

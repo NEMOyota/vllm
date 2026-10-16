@@ -242,13 +242,18 @@ def test_weights_mapper_stacks_one_weight_into_several_shards():
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("family", ["llama", "qwen2", "qwen3"])
+@pytest.mark.skipif(
+    not current_platform.is_cpu(), reason="Uses CPU attention reference kernels"
+)
+@pytest.mark.parametrize(
+    "family", ["llama", "qwen2", "qwen3", "qwen3_5", "qwen3_5_lm_only"]
+)
 @pytest.mark.parametrize("partition", [(0, 4, 0), (1, 2, 1), (0, 3, 1), (1, 3, 0)])
 @pytest.mark.parametrize("tied", [False, True])
 def test_dense_pp_endpoints_match_unsplit_model(
     monkeypatch, tmp_path, family, partition, tied
 ):
-    """Run real model projections/norms/MLPs with CPU SDPA in place of paged KV.
+    """Run real model projections/norms/MLPs with reference attention kernels.
 
     This exercises prefill chunks and decode after checkpoint weight loading;
     only the device-specific attention cache kernel and process groups are replaced.
@@ -264,20 +269,46 @@ def test_dense_pp_endpoints_match_unsplit_model(
         CompilationConfig,
         ModelConfig,
         VllmConfig,
+        get_current_vllm_config,
         set_current_vllm_config,
     )
     from vllm.model_executor.layers.attention import Attention
     from vllm.model_executor.models.llama import LlamaForCausalLM
     from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
     from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
+    from vllm.model_executor.models.qwen3_5 import (
+        Qwen3_5ForCausalLM,
+        Qwen3_5ForConditionalGeneration,
+    )
     from vllm.sequence import IntermediateTensors
+    from vllm.utils.torch_utils import _resolve_layer_name
 
     config_cls, model_cls = {
         "llama": (transformers.LlamaConfig, LlamaForCausalLM),
         "qwen2": (transformers.Qwen2Config, Qwen2ForCausalLM),
         "qwen3": (transformers.Qwen3Config, Qwen3ForCausalLM),
+        "qwen3_5": (transformers.Qwen3_5TextConfig, Qwen3_5ForCausalLM),
+        "qwen3_5_lm_only": (
+            transformers.Qwen3_5TextConfig,
+            Qwen3_5ForConditionalGeneration,
+        ),
     }[family]
-    config_cls(
+    is_hybrid = family.startswith("qwen3_5")
+    language_model_only = family == "qwen3_5_lm_only"
+    hybrid_config = (
+        dict(
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=3,
+            layer_types=["linear_attention", "full_attention"] * 2,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        )
+        if is_hybrid
+        else {}
+    )
+    hf_config = config_cls(
         vocab_size=64,
         hidden_size=32,
         intermediate_size=64,
@@ -288,12 +319,72 @@ def test_dense_pp_endpoints_match_unsplit_model(
         max_position_embeddings=64,
         tie_word_embeddings=tied,
         architectures=[model_cls.__name__],
-    ).save_pretrained(tmp_path)
+        **hybrid_config,
+    )
+    if language_model_only:
+        hf_config = transformers.Qwen3_5Config(
+            text_config=hf_config.to_dict(),
+            vision_config=dict(
+                depth=1,
+                hidden_size=32,
+                intermediate_size=64,
+                num_heads=2,
+                out_hidden_size=32,
+            ),
+            architectures=[model_cls.__name__],
+        )
+    hf_config.save_pretrained(tmp_path)
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "cache"))
+    # This test executes model layers only, without a V2 runner or Triton kernels.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     monkeypatch.setattr(
         parallel_state, "_TP", SimpleNamespace(rank_in_group=0, world_size=1)
     )
     cache: dict[Attention, tuple[torch.Tensor, torch.Tensor]] = {}
+    recurrent_cache: dict[torch.nn.Module, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def gdn_core(mixed_qkv, b, a, output, layer_name):
+        # Replace only the device kernel: production GDN projections, gating
+        # normalization and output projection remain active around this call.
+        layer = get_current_vllm_config().compilation_config.static_forward_context[
+            _resolve_layer_name(layer_name)
+        ]
+        previous = recurrent_cache.get(layer)
+        if previous is None:
+            conv = mixed_qkv.new_zeros(layer.conv_kernel_size - 1, layer.conv_dim)
+            state = mixed_qkv.new_zeros(
+                layer.num_v_heads, layer.head_v_dim, layer.head_k_dim
+            )
+        else:
+            conv, state = previous
+        sequence = torch.cat((conv, mixed_qkv))
+        convolved = F.silu(
+            (
+                sequence.unfold(0, layer.conv_kernel_size, 1)
+                * layer.conv1d.weight.squeeze(1)
+            ).sum(-1)
+        )
+        q, k, v = convolved.split(
+            [layer.key_dim, layer.key_dim, layer.value_dim], dim=-1
+        )
+        q = q.view(-1, layer.num_k_heads, layer.head_k_dim)
+        k = k.view(-1, layer.num_k_heads, layer.head_k_dim)
+        q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
+        k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
+        q = q.repeat_interleave(layer.num_v_heads // layer.num_k_heads, dim=1)
+        k = k.repeat_interleave(layer.num_v_heads // layer.num_k_heads, dim=1)
+        v = v.view(-1, layer.num_v_heads, layer.head_v_dim)
+        decay = (-layer.A_log.exp() * F.softplus(a + layer.dt_bias)).exp()
+        beta = b.sigmoid()
+        for index in range(mixed_qkv.shape[0]):
+            state = state * decay[index, :, None, None]
+            delta = v[index] - (state * k[index, :, None, :]).sum(-1)
+            delta = delta * beta[index, :, None]
+            state = state + delta.unsqueeze(-1) * k[index, :, None, :]
+            output[index] = (state * q[index, :, None, :]).sum(-1) * (
+                layer.head_k_dim**-0.5
+            )
+        recurrent_cache[layer] = sequence[-(layer.conv_kernel_size - 1) :], state
 
     def attention(layer, q, k, v, **kwargs):
         q = q.view(-1, layer.num_heads, layer.head_size).transpose(0, 1)
@@ -331,6 +422,7 @@ def test_dense_pp_endpoints_match_unsplit_model(
         enforce_eager=True,
         dtype="float32",
         max_model_len=64,
+        language_model_only=language_model_only,
     )
 
     def build_model():
@@ -349,9 +441,28 @@ def test_dense_pp_endpoints_match_unsplit_model(
     with torch.no_grad():
         for parameter in reference.parameters():
             parameter.normal_(std=0.1)
-    checkpoint = [
-        (name, p.detach().clone()) for name, p in reference.named_parameters()
-    ]
+    checkpoint: list[tuple[str, torch.Tensor]] = []
+    for name, parameter in reference.named_parameters():
+        value = parameter.detach().clone()
+        if is_hybrid and name.endswith(".in_proj_qkvz.weight"):
+            gdn = reference.get_submodule(name.rsplit(".", 2)[0])
+            qkv, z = value.split([gdn.key_dim * 2 + gdn.value_dim, gdn.value_dim])
+            checkpoint.extend(
+                [
+                    (name.replace(".in_proj_qkvz.", ".in_proj_qkv."), qkv),
+                    (name.replace(".in_proj_qkvz.", ".in_proj_z."), z),
+                ]
+            )
+        elif is_hybrid and name.endswith(".in_proj_ba.weight"):
+            b, a = value.chunk(2)
+            checkpoint.extend(
+                [
+                    (name.replace(".in_proj_ba.", ".in_proj_b."), b),
+                    (name.replace(".in_proj_ba.", ".in_proj_a."), a),
+                ]
+            )
+        else:
+            checkpoint.append((name, value))
 
     def finalize_weights(model):
         for module in model.modules():
@@ -371,12 +482,26 @@ def test_dense_pp_endpoints_match_unsplit_model(
         finalize_weights(stage)
         stages.append((stage, config))
 
+    if is_hybrid:
+        monkeypatch.setattr(torch.ops.vllm, "cpu_gdn_attention_core", gdn_core)
+        from vllm.model_executor.models.utils import PPMissingLayer
+
+        for rank, (stage, _) in enumerate(stages):
+            model = stage.language_model.model if language_model_only else stage.model
+            assert isinstance(model.embed_tokens, PPMissingLayer) == (
+                rank != 0 and not (rank == 2 and tied)
+            )
+            assert not model.use_sequence_parallel
+            if language_model_only:
+                assert list(stage.visual.parameters()) == []
+
     with torch.inference_mode():
         for tokens in (
             torch.tensor([1, 4, 8, 3, 2, 7]),
             torch.tensor([9, 2, 1, 6, 5, 4]),
         ):
             cache.clear()
+            recurrent_cache.clear()
             offset = 0
             for chunk_size in (3, 2, 1):
                 input_ids = tokens[offset : offset + chunk_size]
@@ -410,3 +535,6 @@ def test_dense_pp_endpoints_match_unsplit_model(
                     logits, expected_logits, atol=1e-6, rtol=1e-5
                 )
                 offset += chunk_size
+            if is_hybrid:
+                # Two linear-attention layers, each in the reference and PP model.
+                assert len(recurrent_cache) == 4

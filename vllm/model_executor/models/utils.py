@@ -915,6 +915,11 @@ def make_layers(
             if vllm_config is not None
             else None
         ),
+        layer_types=(
+            getattr(vllm_config.model_config.hf_text_config, "layer_types", None)
+            if vllm_config is not None and vllm_config.model_config is not None
+            else None
+        ),
     )
 
     modules = torch.nn.ModuleList(

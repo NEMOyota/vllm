@@ -1024,8 +1024,7 @@ def generate_scheduler_kv_cache_config(
         cfg.hisparse_host_num_blocks == kv_cache_configs[0].hisparse_host_num_blocks
         for cfg in kv_cache_configs
     )
-    # An embedding-only first PP stage has no physical cache. Use a stage
-    # holding attention layers as the scheduler's representative instead.
+    # Keep one physical allocation as a reference for consumers such as offload.
     representative = next(
         (
             cfg
@@ -1035,13 +1034,29 @@ def generate_scheduler_kv_cache_config(
         kv_cache_configs[0],
     )
     cfg = copy.deepcopy(representative)
-    for group in cfg.kv_cache_groups:
+    cfg.kv_tp_replicas = math.gcd(
+        *(worker.kv_tp_replicas for worker in kv_cache_configs)
+    )
+    cfg.kv_cache_groups = []
+    for worker_groups in zip(
+        *(worker.kv_cache_groups for worker in kv_cache_configs), strict=True
+    ):
+        # Hybrid PP stages can each hold a different subset of cache types.
+        # Choose a representative separately for every global group ID.
+        group = copy.deepcopy(
+            next(
+                (group for group in worker_groups if group.layer_names),
+                worker_groups[0],
+            )
+        )
+        group.is_eagle_group = any(group.is_eagle_group for group in worker_groups)
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
             # so use an arbitrary one to initialize the scheduler.
             group.kv_cache_spec = next(
                 iter(group.kv_cache_spec.kv_cache_specs.values())
             )
+        cfg.kv_cache_groups.append(group)
     return cfg
 
 

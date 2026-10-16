@@ -1713,6 +1713,7 @@ class ModelConfig:
             pp_rank,
             pp_size,
             partition_config=parallel_config.pipeline_partition_config,
+            layer_types=getattr(self.hf_text_config, "layer_types", None),
         )
         return start, end
 

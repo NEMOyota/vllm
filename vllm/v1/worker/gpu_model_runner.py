@@ -1003,6 +1003,15 @@ class GPUModelRunner(
             with_numpy=numpy,
         )
 
+    @property
+    def _has_mamba_layers(self) -> bool:
+        # Logical cache groups can have no local layers on this PP rank.
+        return any(
+            group.layer_names
+            and get_kv_cache_spec_kind(group.kv_cache_spec) == KVCacheSpecKind.MAMBA
+            for group in self.kv_cache_config.kv_cache_groups
+        )
+
     def _get_mamba_state_copy_funcs(self) -> MambaStateCopyFuncsByType:
         if self._mamba_state_copy_funcs is None:
             mamba_groups = mamba_utils.get_mamba_groups(self.kv_cache_config)
@@ -1558,7 +1567,7 @@ class GPUModelRunner(
         num_reqs = output_token_ids.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
-        if self.cache_config.mamba_cache_mode == "align":
+        if self.cache_config.mamba_cache_mode == "align" and self._has_mamba_layers:
             # Fused GPU postprocess: state copies + per-request accepted-token
             # update without CPU-GPU sync. The metadata
             # (num_scheduled_tokens, num_draft_tokens, num_computed_tokens) is
@@ -4077,7 +4086,7 @@ class GPUModelRunner(
             )
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
-            if self.cache_config.mamba_cache_mode == "align":
+            if self.cache_config.mamba_cache_mode == "align" and self._has_mamba_layers:
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
                 # to decide copy operations, so we must apply deferred
                 # corrections before it runs.

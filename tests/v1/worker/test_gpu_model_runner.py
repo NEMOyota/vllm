@@ -53,6 +53,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -189,6 +191,88 @@ def test_prepare_padding_mask_marks_sequence_parallel_padding():
     mask = runner._prepare_padding_mask(0, 8)
 
     assert mask.all()
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("local_attention", "local_mamba"),
+    [(False, False), (True, False), (False, True), (True, True)],
+    ids=["empty-endpoint", "attention-only", "mamba-only", "hybrid"],
+)
+@pytest.mark.parametrize("uniform", [False, True])
+def test_mamba_align_postprocess_uses_only_local_layers(
+    monkeypatch: pytest.MonkeyPatch,
+    local_attention: bool,
+    local_mamba: bool,
+    uniform: bool,
+):
+    """PP placeholders must retain accepted counts without copying remote state."""
+    attention_spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32
+    )
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((8,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["attention"] if local_attention else [],
+                kv_cache_spec=attention_spec,
+            ),
+            KVCacheGroupSpec(
+                layer_names=["mamba"] if local_mamba else [],
+                kv_cache_spec=UniformTypeKVCacheSpecs(
+                    block_size=16, kv_cache_specs={"mamba": mamba_spec}
+                )
+                if uniform
+                else mamba_spec,
+            ),
+        ],
+    )
+    runner.cache_config = SimpleNamespace(mamba_cache_mode="align")
+    runner.speculative_config = SimpleNamespace()
+    runner.model_config = SimpleNamespace(is_hybrid=True)
+    runner.num_accepted_tokens = SimpleNamespace(
+        gpu=torch.full((3,), -99, dtype=torch.int32)
+    )
+    runner.input_batch = SimpleNamespace(
+        num_accepted_tokens_cpu_tensor=torch.full((3,), -99, dtype=torch.int32)
+    )
+    runner.num_accepted_tokens_event = Mock()
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner._get_mamba_bufs = Mock()
+    runner._get_mamba_state_copy_funcs = Mock()
+    postprocess = Mock()
+    monkeypatch.setattr(
+        gpu_model_runner_module.mamba_utils, "postprocess_mamba_align_gpu", postprocess
+    )
+
+    assert runner.kv_cache_config.has_mamba_layers
+    assert runner._has_mamba_layers is local_mamba
+    runner._update_states_after_model_execute(
+        torch.tensor([[3, 4, -1], [5, -1, -1]]), Mock()
+    )
+
+    assert runner.num_accepted_tokens.gpu.tolist() == [2, 1, -99]
+    runner.num_accepted_tokens_event.record.assert_called_once_with()
+    if local_mamba:
+        postprocess.assert_called_once()
+        assert postprocess.call_args.kwargs["kv_cache_config"] is runner.kv_cache_config
+        mamba_groups = gpu_model_runner_module.mamba_utils.get_mamba_groups(
+            runner.kv_cache_config
+        )
+        assert mamba_groups == {mamba_spec: [1]}
+    else:
+        postprocess.assert_not_called()
+        runner._get_mamba_bufs.assert_not_called()
+        runner._get_mamba_state_copy_funcs.assert_not_called()
+        assert runner.input_batch.num_accepted_tokens_cpu_tensor.tolist() == [2, 1, -99]
 
 
 @pytest.fixture

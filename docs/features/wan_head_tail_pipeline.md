@@ -9,6 +9,11 @@ This is an experimental, opt-in feature. Current validation covers CPU
 configuration, reference-model, and transport-protocol tests. Multi-node
 GPU/NCCL validation and WAN performance measurements are still pending.
 
+The first hybrid acceptance target is the non-MoE Qwen3.5 language tower.
+Here, hybrid means Gated DeltaNet (GDN) linear-attention layers mixed with full
+attention, not a mixture of experts. Dense Llama, Qwen2, and Qwen3 configurations
+remain available as simpler reference cases.
+
 The objective is to use remote compute while controlling communication memory
 and exposing opportunities to overlap communication with independent work.
 Whether this helps a particular WAN deployment requires measurement: the
@@ -36,7 +41,8 @@ flowchart LR
     M -->|Intermediate tensors| T
 ```
 
-Each stage owns a contiguous layer range and its corresponding KV cache. The
+Each stage owns a contiguous layer range and its corresponding attention KV
+cache or GDN recurrent/convolution state. The
 existing model implementation still determines which intermediate tensors are
 sent, such as hidden states and residuals. This is pipeline parallelism within
 one replica; it does not create separate prefill and decode instances or transfer
@@ -59,6 +65,7 @@ nested mapping in a `vllm serve --config` YAML file.
 | `tail_layers` | Fixed number of transformer layers on the last stage; zero is allowed. |
 | `stage_compute_weights` | Positive relative compute capacities, one per stage. Larger values receive more work. |
 | `layer_costs` | Positive relative cost for every transformer layer, in model order. |
+| `layer_type_costs` | Positive relative cost per HF layer type; expanded using the text model's `layer_types`. Mutually exclusive with `layer_costs`. |
 | `stage_node_ips` | One Ray node address per pipeline stage; addresses may repeat. |
 
 Setting either endpoint count fixes both endpoints; an omitted endpoint defaults
@@ -67,17 +74,29 @@ receive at least one transformer layer, and the configured endpoints must leave
 enough layers for those stages.
 
 With no fixed endpoints, all stages receive at least one layer. Without
-`layer_costs`, weights divide layer counts proportionally using constrained
+either cost option, weights divide layer counts proportionally using constrained
 largest-remainder allocation. Equal remainders prefer lower pipeline ranks.
 With costs, the planner chooses contiguous boundaries near cumulative weighted
 cost targets. It is a partitioning heuristic, not an optimal latency solver.
 Fixed endpoints ignore their weights when distributing the remaining layers.
+
+For Qwen3.5, a mapping such as
+`{"linear_attention": 1.0, "full_attention": 4.0}` expands to one cost per layer
+using the local HF text configuration. These numbers only illustrate the API;
+they are not measured GDN/full-attention performance ratios. Keys must exactly
+match the layer types in the model; missing or unused keys are rejected. With
+fixed zero endpoints and PP=3, all layers
+belong to the sole middle stage, so cost weighting cannot change that boundary.
 
 Weights and costs are user inputs, typically obtained from offline profiling.
 There is no automatic hardware benchmarking, online weight adjustment, or
 network-aware repartitioning. Profile the intended batch and context sizes, and
 balance measured stage compute time rather than layer counts alone. Account
 separately for embedding and LM-head work, per-stage KV memory, and link costs.
+
+Hybrid partitions require the V2 model runner, including when the optional
+transport is disabled, so stages with different local layer types use consistent
+request ordering.
 
 Do not combine this configuration with `VLLM_PP_LAYER_PARTITION`. Check the
 `Resolved pipeline transformer layer counts` startup log before testing.
@@ -95,13 +114,24 @@ is approximately `2 * T * H * dtype_bytes` for `T` scheduled tokens and hidden
 size `H`, before metadata and backend overhead. No zero-residual wire compression
 is implemented. Include both tensors when estimating the WAN traffic budget.
 
-The initial zero-transformer scope is native dense `LlamaForCausalLM`,
-`Qwen2ForCausalLM`, and `Qwen3ForCausalLM` text generation, with `enforce_eager`
-enabled. It requires DP=PCP=DCP=1 and excludes expert parallelism, multimodal
-models, KV/encoder disaggregation, KV offloading, and microbatching/DBO.
+Zero-transformer endpoints support the native non-MoE Qwen3.5 language tower:
+`Qwen3_5ForCausalLM`, or `Qwen3_5ForConditionalGeneration` with
+`--language-model-only`. Native dense `LlamaForCausalLM`, `Qwen2ForCausalLM`, and
+`Qwen3ForCausalLM` text generation are also supported. All require the V2 model
+runner, `--enforce-eager`, and DP=PCP=DCP=1. Qwen3.5 MoE, image/video inputs, expert
+parallelism, KV/encoder disaggregation, KV offloading, and microbatching/DBO are
+outside the zero-endpoint scope. MTP/speculative decoding remains disabled.
 Positive-layer partitions retain the model's ordinary pipeline-parallel support
 requirements. Both new partition and transport configurations currently reject
 speculative decoding.
+
+For a hybrid partition, size both attention KV and GDN states on the stages that
+own those layers. Empty endpoints own neither state type; an intermediate stage
+may own only one type. A zero local Mamba-state allocation must not be treated as
+evidence that the global model has no recurrent layers.
+Prefix caching follows the native hybrid-cache rules: it requires chunked
+prefill and aligned recurrent-state caching. Record the resolved cache mode and
+keep cache-group identities consistent across stages when validating reuse.
 
 Local embedding is not a privacy boundary. Native scheduler messages still
 distribute token IDs, and intermediate representations may contain sensitive
@@ -149,16 +179,20 @@ and the multiprocessing or Ray V2 executor. Set `VLLM_USE_V2_MODEL_RUNNER=1` and
 use a platform/model combination that supports that runner. CPU execution,
 KV/encoder disaggregation, KV offloading, and microbatching/DBO are excluded when
 transport is enabled. Transport errors propagate to the worker/executor; this
-feature does not provide session replay after failure. Partitioning without this
-transport can still use the V1 model runner.
+feature does not provide session replay after failure. With this transport
+disabled, positive-layer dense reference partitions can still use the V1 model
+runner. Zero endpoints and hybrid partitions require an actually selected V2
+model runner, independently of the transport setting.
 
 ## Configuration and launch
 
 The runnable templates are in
 [examples/features/head_tail_pipeline](../../examples/features/head_tail_pipeline/README.md).
-They use `Qwen/Qwen2.5-0.5B-Instruct`, TP=1, PP=3, eager execution, and native
-chunked prefill. The small model is for configuration and correctness checks;
-it is not evidence of a WAN performance benefit.
+Start with the Qwen3.5 language-only templates and replace
+`/path/to/local/Qwen3.5` with the same local checkpoint path on every node. They
+use TP=1, PP=3, eager execution, and native chunked prefill. The three
+`Qwen/Qwen2.5-0.5B-Instruct` templates remain available for dense reference
+checks. Templates demonstrate configuration, not a measured WAN benefit.
 
 1. Prepare a Ray cluster using the same vLLM revision and model files on all
    nodes. Follow the [multi-node deployment guide](../serving/parallelism_scaling.md#multi-node-deployment).
@@ -171,14 +205,16 @@ it is not evidence of a WAN performance benefit.
 
     ```bash
     VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1 VLLM_USE_V2_MODEL_RUNNER=1 \
-        vllm serve --config examples/features/head_tail_pipeline/explicit.yaml
+        vllm serve --config examples/features/head_tail_pipeline/qwen3_5_hybrid.yaml
     ```
 
-| Template | Partition for the example 24-layer model |
+| Template | Partition |
 | --- | --- |
-| [`explicit.yaml`](../../examples/features/head_tail_pipeline/explicit.yaml) | `[2, 20, 2]`: fixed head and tail. |
-| [`weighted.yaml`](../../examples/features/head_tail_pipeline/weighted.yaml) | `[4, 16, 4]`: weights `[1, 4, 1]`, no fixed endpoints. |
-| [`encoding_only.yaml`](../../examples/features/head_tail_pipeline/encoding_only.yaml) | `[0, 24, 0]`: embedding and output-head endpoints. |
+| [`qwen3_5_hybrid.yaml`](../../examples/features/head_tail_pipeline/qwen3_5_hybrid.yaml) | Nonempty stages weighted by `[1, 4, 1]` and illustrative layer-type costs. Read resolved boundaries from the local Qwen3.5 configuration. |
+| [`qwen3_5_encoding_only.yaml`](../../examples/features/head_tail_pipeline/qwen3_5_encoding_only.yaml) | `[0, L, 0]` for a Qwen3.5 language tower with `L` layers. |
+| [`explicit.yaml`](../../examples/features/head_tail_pipeline/explicit.yaml) | Dense 24-layer reference: `[2, 20, 2]`. |
+| [`weighted.yaml`](../../examples/features/head_tail_pipeline/weighted.yaml) | Dense 24-layer reference: `[4, 16, 4]`, weights `[1, 4, 1]`. |
+| [`encoding_only.yaml`](../../examples/features/head_tail_pipeline/encoding_only.yaml) | Dense 24-layer reference: `[0, 24, 0]`. |
 
 For a different model, verify its transformer-layer count and the resolved
 partition. The YAML filename `encoding_only` refers to the first stage's token
@@ -210,6 +246,20 @@ establishing GPU model correctness or WAN performance:
     tests/distributed/test_pp_transport.py -q
 ```
 
+On a CPU test environment, also run the model-reference and hybrid-state cases:
+
+```bash
+.venv/bin/python -m pytest \
+    tests/models/test_utils.py::test_dense_pp_endpoints_match_unsplit_model \
+    tests/v1/worker/test_gpu_model_runner.py::test_mamba_align_postprocess_uses_only_local_layers \
+    tests/v1/worker/test_gpu_model_runner_v2.py::test_gather_batch_req_state_has_consistent_pp_order \
+    tests/v1/worker/test_mamba_hybrid_model_state.py::test_hybrid_pp_stage_only_initializes_its_local_model_state -q
+```
+
+The model-reference cases use CPU attention/GDN reference kernels around native
+model projections and state updates. They check partition equivalence, not the
+production GPU recurrent kernels or inter-node execution.
+
 Then validate on the target GPU cluster:
 
 1. Compare deterministic generations with an unsplit reference using identical
@@ -222,8 +272,11 @@ Then validate on the target GPU cluster:
    Exercise a batch near the configured byte budget and verify oversized
    batches fail clearly rather than hang.
 3. Confirm stage-to-node placement and distinct GPU allocation. For zero-layer
-   endpoints, verify that the middle stage owns the attention/KV layers and
-   that first/last stages perform their embedding/output roles.
+   Qwen3.5 endpoints, verify that the middle stage owns both attention KV and GDN
+   states, and that first/last stages perform their embedding/output roles.
+   Also test a hybrid partition with a stage containing only GDN layers and one
+   containing only full-attention layers. Include prefill followed by multiple
+   decode steps; a single forward does not validate recurrent state updates.
 4. Test link delay, constrained bandwidth, and transport failure on an isolated
    test network. Record the actual path and backend; host TCP shaping does not
    necessarily affect an RDMA path. A failed run must terminate visibly rather
@@ -234,7 +287,8 @@ Use `vllm bench serve` for end-to-end measurements, for example:
 ```bash
 vllm bench serve \
     --backend vllm \
-    --model Qwen/Qwen2.5-0.5B-Instruct \
+    --model /path/to/local/Qwen3.5 \
+    --served-model-name qwen3.5-head-tail \
     --base-url http://127.0.0.1:8000 \
     --endpoint /v1/completions \
     --dataset-name random \

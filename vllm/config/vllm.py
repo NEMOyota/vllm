@@ -1449,24 +1449,43 @@ class VllmConfig:
         if partition is None or model is None:
             return
         counts = partition.resolve(
-            model.get_total_num_hidden_layers(), parallel.pipeline_parallel_size
+            model.get_total_num_hidden_layers(),
+            parallel.pipeline_parallel_size,
+            layer_types=getattr(model.hf_text_config, "layer_types", None),
         )
         logger.info("Resolved pipeline transformer layer counts: %s", counts)
+        if (model.is_hybrid or 0 in counts) and not self.use_v2_model_runner:
+            raise ValueError(
+                "Hybrid or zero-transformer pipeline partitions require the V2 "
+                "model runner for consistent request ordering across stages."
+            )
         if 0 not in counts:
             return
 
-        supported = {"LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"}
+        dense_text = (
+            model.architecture
+            in {"LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"}
+            and not model.is_hybrid
+            and model.multimodal_config is None
+        )
+        qwen35_text = (
+            model.architecture == "Qwen3_5ForCausalLM"
+            and model.multimodal_config is None
+        ) or (
+            model.architecture == "Qwen3_5ForConditionalGeneration"
+            and model.multimodal_config is not None
+            and model.multimodal_config.language_model_only
+        )
         if (
-            model.architecture not in supported
+            not (dense_text or qwen35_text)
             or model.model_impl not in ("auto", "vllm")
             or model.runner_type != "generate"
             or model.is_moe
-            or model.is_hybrid
-            or model.multimodal_config is not None
         ):
             raise ValueError(
                 "Zero-transformer pipeline endpoints currently support native dense "
-                "Llama, Qwen2, and Qwen3 text generation models only."
+                "Llama, Qwen2, Qwen3 and non-MoE Qwen3.5 text generation. "
+                "Qwen3.5 conditional generation requires --language-model-only."
             )
         if not model.enforce_eager:
             raise ValueError(
