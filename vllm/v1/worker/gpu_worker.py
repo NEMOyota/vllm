@@ -56,6 +56,7 @@ from vllm.distributed.parallel_state import (
     resume_device_comms,
     suspend_device_comms,
 )
+from vllm.distributed.pp_transport import PipelineTransport, ReceiveTicket
 from vllm.distributed.weight_transfer import (
     WeightTransferEngine,
     WeightTransferEngineFactory,
@@ -165,15 +166,19 @@ class AsyncIntermediateTensors(IntermediateTensors):
         tensors: dict[str, torch.Tensor],
         comm_handles: list[Handle] | None = None,
         comm_postprocess: list[Callable[[], None]] | None = None,
+        receive_ticket: ReceiveTicket | None = None,
     ) -> None:
         super().__init__(tensors)
         self._comm_handles = comm_handles
         self._comm_postprocess = comm_postprocess
+        self._receive_ticket = receive_ticket
         self._comm_waited = False
 
     def wait_for_comm(self) -> None:
         if self._comm_waited:
             return
+        if self._receive_ticket is not None:
+            self.tensors = self._receive_ticket.wait()
         if self._comm_handles:
             for handle in self._comm_handles:
                 handle.wait()
@@ -238,6 +243,7 @@ class Worker(WorkerBase):
 
         # Device handles of the previous step's PP intermediate-tensor send.
         self._pp_send_work: list[Handle] = []
+        self._pp_transport: PipelineTransport | None = None
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -292,6 +298,8 @@ class Worker(WorkerBase):
         self._sleep_saved_parameters.clear()
 
     def sleep(self, level: int = 1) -> None:
+        if self._pp_transport is not None:
+            self._pp_transport.drain()
         torch.accelerator.synchronize()
         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
 
@@ -1302,6 +1310,8 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        if self._pp_transport is not None:
+            self._pp_transport.check_error()
         return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
@@ -1309,6 +1319,18 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        transport_config = self.parallel_config.pipeline_transport_config
+        transport = self._pp_transport
+        if transport_config.enabled and transport is None:
+            transport = self._pp_transport = PipelineTransport(
+                get_pp_group(),
+                max_inflight_sends=transport_config.max_inflight_sends,
+                max_inflight_bytes=transport_config.max_inflight_bytes,
+                async_receive=transport_config.async_receive,
+            )
+        if transport is not None:
+            transport.check_error()
+
         # Wait for the previous step's sends so this forward pass cannot
         # overwrite buffers they are still reading.
         if self._pp_send_work:
@@ -1319,17 +1341,23 @@ class Worker(WorkerBase):
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
+            if transport is not None:
+                intermediate_tensors = AsyncIntermediateTensors(
+                    {},
+                    receive_ticket=transport.receive(all_gather_group=get_tp_group()),
                 )
-            )
-            assert tensor_dict is not None
-            intermediate_tensors = AsyncIntermediateTensors(
-                tensor_dict,
-                comm_handles=comm_handles,
-                comm_postprocess=comm_postprocess,
-            )
+            else:
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                    )
+                )
+                assert tensor_dict is not None
+                intermediate_tensors = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=comm_handles,
+                    comm_postprocess=comm_postprocess,
+                )
 
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
@@ -1353,14 +1381,16 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # Non-blocking send of the intermediate tensors. The metadata handle
-        # is reaped lazily by the GroupCoordinator; the device handles are
-        # waited at the top of the next step.
-        handles = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-        )
-        self._pp_send_work = handles[1:]
+        # Owned snapshots permit the next forward to reuse its output buffers.
+        # The default path instead waits its device handles at the next step.
+        if transport is not None:
+            transport.send(output.tensors, all_gather_group=get_tp_group())
+        else:
+            handles = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=get_tp_group(),
+            )
+            self._pp_send_work = handles[1:]
 
         if self.use_v2_model_runner and self.model_runner.is_pooling_model:
             return self.model_runner.pool()  # type: ignore
@@ -1611,6 +1641,8 @@ class Worker(WorkerBase):
             self.model_runner.reset_lora_state()
 
     def shutdown(self) -> None:
+        if transport := getattr(self, "_pp_transport", None):
+            transport.close()
         gc.unfreeze()
 
         # has_kv_transfer_group can be None during interpreter shutdown.

@@ -14,6 +14,7 @@ from torch.distributed import ProcessGroup, ReduceOp, Store
 
 import vllm.envs as envs
 from vllm.config.fault_tolerance import FaultToleranceConfig
+from vllm.config.pipeline import PipelinePartitionConfig, PipelineTransportConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -138,6 +139,14 @@ class ParallelConfig:
 
     pipeline_parallel_size: int = Field(default=1, ge=1)
     """Number of pipeline parallel groups."""
+    pipeline_partition_config: PipelinePartitionConfig | None = None
+    """Explicit head/tail layers or compute-weighted contiguous PP partitioning.
+    Layer counts are resolved from the model configuration on every worker.
+    Cannot be combined with VLLM_PP_LAYER_PARTITION."""
+    pipeline_transport_config: PipelineTransportConfig = Field(
+        default_factory=PipelineTransportConfig
+    )
+    """Opt-in bounded PP send staging and asynchronous input reception."""
     tensor_parallel_size: int = Field(default=1, ge=1)
     """Number of tensor parallel groups."""
     prefill_context_parallel_size: int = Field(default=1, ge=1)
@@ -519,6 +528,37 @@ class ParallelConfig:
 
     @model_validator(mode="after")
     def _validate_parallel_config(self) -> Self:
+        partition = self.pipeline_partition_config
+        transport = self.pipeline_transport_config
+        if partition is not None:
+            if self.pipeline_parallel_size < 2:
+                raise ValueError("pipeline_partition_config requires PP >= 2.")
+            if envs.VLLM_PP_LAYER_PARTITION is not None:
+                raise ValueError(
+                    "Use pipeline_partition_config or VLLM_PP_LAYER_PARTITION, "
+                    "not both."
+                )
+            if partition.stage_node_ips is not None:
+                if self.distributed_executor_backend != "ray":
+                    raise ValueError("stage_node_ips requires the Ray executor.")
+                if (
+                    self.data_parallel_size != 1
+                    or self.prefill_context_parallel_size != 1
+                ):
+                    raise ValueError("stage_node_ips requires DP=1 and PCP=1.")
+                if len(partition.stage_node_ips) != self.pipeline_parallel_size:
+                    raise ValueError("stage_node_ips must contain one IP per PP stage.")
+        if transport.enabled:
+            if self.pipeline_parallel_size < 2:
+                raise ValueError("pipeline_transport_config requires PP >= 2.")
+            if self.distributed_executor_backend not in ("mp", "ray"):
+                raise ValueError("Pipeline transport requires the mp or Ray executor.")
+            if (
+                self.distributed_executor_backend == "ray"
+                and not envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
+            ):
+                raise ValueError("Pipeline transport requires the Ray V2 executor.")
+
         if self._api_process_rank >= self._api_process_count:
             raise ValueError(
                 "Invalid value of `_api_process_rank`. "

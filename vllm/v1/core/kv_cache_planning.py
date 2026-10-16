@@ -532,6 +532,8 @@ def _get_kv_cache_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec], layout: KVCacheLayout
 ) -> int:
     """Return the largest cache group's bytes per block."""
+    if not any(group.layer_names for group in kv_cache_groups):
+        return 0
     if not layout.is_block_outermost:
         # Each layer's block stride is its own padded page.
         return max(
@@ -612,9 +614,10 @@ def get_kv_cache_config_from_groups(
         The generated KVCacheConfig
 
     """
-    if len(kv_cache_groups) == 0:
-        # Attention free models do not have KV cache.
-        # Return num_blocks=1 as BlockPool always needs a null_block.
+    if not any(group.layer_names for group in kv_cache_groups):
+        # A PP stage without attention retains the global group IDs but has no
+        # physical KV storage. get_kv_cache_configs assigns its logical capacity.
+        # Fully attention-free models still need one null block in BlockPool.
         return KVCacheConfig(
             num_blocks=1,
             kv_cache_tensors=[],
@@ -1380,7 +1383,10 @@ def _auto_fit_max_model_len(
     """
     original_max = vllm_config.model_config.max_model_len
 
-    if all(not groups for groups in projected_groups_per_worker):
+    if all(
+        not any(group.layer_names for group in groups)
+        for groups in projected_groups_per_worker
+    ):
         # All workers have empty specs (attention-free model)
         logger.info_once(
             "Auto-fit max_model_len: attention-free model, "
@@ -1393,7 +1399,7 @@ def _auto_fit_max_model_len(
     auto_fit_max = original_max
     limiting_worker_mem = available_memory[0]
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
-        if not groups:
+        if not any(group.layer_names for group in groups):
             continue
         worker_max = _estimate_max_model_len_from_groups(vllm_config, groups, avail_mem)
         if worker_max < auto_fit_max:
@@ -1562,7 +1568,7 @@ def get_kv_cache_configs(
     if override is not None:
         adjusted_memory: list[int] = []
         for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
-            if not groups:
+            if not any(group.layer_names for group in groups):
                 adjusted_memory.append(avail_mem)
                 continue
             bytes_per_block = _pool_bytes_per_block(vllm_config, groups)
@@ -1587,7 +1593,7 @@ def get_kv_cache_configs(
 
     # Check if the available memory is enough per worker.
     for groups, avail_mem in zip(projected_groups_per_worker, check_memory):
-        if not groups:
+        if not any(group.layer_names for group in groups):
             continue
         _check_enough_kv_cache_memory(
             avail_mem,
@@ -1613,9 +1619,17 @@ def get_kv_cache_configs(
     # We also need to shrink the tensor size proportionally to avoid
     # allocating unused memory.
     min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+        (
+            cfg.num_blocks
+            for cfg in kv_cache_configs
+            if any(group.layer_names for group in cfg.kv_cache_groups)
+        ),
+        default=1,
     )
     for i, kv_cache_config in enumerate(kv_cache_configs):
+        if not any(group.layer_names for group in kv_cache_config.kv_cache_groups):
+            kv_cache_config.num_blocks = min_num_blocks
+            continue
         if kv_cache_config.num_blocks == min_num_blocks:
             continue
         # Re-plan with exactly the memory the smallest rank can afford, so

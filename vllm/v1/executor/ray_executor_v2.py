@@ -34,7 +34,9 @@ from vllm.v1.executor.ray_utils import (
     WORKER_SPECIFIC_ENV_VARS,
     build_actor_name,
     get_bundles_for_indices,
+    get_bundles_for_pipeline_stages,
     get_bundles_sorted_by_node,
+    get_pipeline_stage_node_ips,
     initialize_ray_cluster,
     ray,
 )
@@ -305,7 +307,12 @@ class RayExecutorV2(MultiprocExecutor):
 
         # Step 2: Build bundle assignments for worker rank placement
         # while respecting VLLM_RAY_BUNDLE_INDICES.
-        if envs.VLLM_RAY_BUNDLE_INDICES:
+        stage_node_ips = get_pipeline_stage_node_ips(self.parallel_config)
+        if stage_node_ips is not None:
+            bundle_to_node_id = get_bundles_for_pipeline_stages(
+                placement_group, stage_node_ips, tp_size
+            )
+        elif envs.VLLM_RAY_BUNDLE_INDICES:
             bundle_to_node_id = get_bundles_for_indices(
                 placement_group,
                 list(map(int, envs.VLLM_RAY_BUNDLE_INDICES.split(","))),
@@ -329,10 +336,13 @@ class RayExecutorV2(MultiprocExecutor):
         # Step 3: Create broadcast MessageQueue.
         # Workers on the driver node use shared memory; the rest use TCP.
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
-        n_local = sum(1 for a in bundle_assignments if a["node_id"] == driver_node)
+        local_reader_ranks = [
+            a["rank"] for a in bundle_assignments if a["node_id"] == driver_node
+        ]
         self.rpc_broadcast_mq = MessageQueue(
             self.world_size,
-            n_local,
+            len(local_reader_ranks),
+            local_reader_ranks=local_reader_ranks,
             max_chunk_bytes=max_chunk_bytes,
             connect_ip=ray.util.get_node_ip_address(),
         )

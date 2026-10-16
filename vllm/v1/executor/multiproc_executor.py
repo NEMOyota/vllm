@@ -1065,6 +1065,13 @@ class WorkerProc:
             # containing its string representation before transport.
             if output_rank is None or self.rank == output_rank:
                 self.handle_output(e)
+            else:
+                parallel_config = self.worker.vllm_config.parallel_config
+                if parallel_config.pipeline_transport_config.enabled:
+                    # A non-output PP rank has no response queue for this RPC.
+                    # Let the worker monitor report the failure while downstream
+                    # ranks wait for the missing activation.
+                    raise
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:

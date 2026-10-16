@@ -1699,12 +1699,21 @@ class ModelConfig:
 
         total_num_hidden_layers = self.get_total_num_hidden_layers()
 
-        # the layout order is: DP x PP x TP
+        # The layout order is: ExternalDP x DP x PP x PCP x TP.
         pp_rank = (
-            parallel_config.rank // parallel_config.tensor_parallel_size
+            parallel_config.rank
+            // (
+                parallel_config.tensor_parallel_size
+                * parallel_config.prefill_context_parallel_size
+            )
         ) % parallel_config.pipeline_parallel_size
         pp_size = parallel_config.pipeline_parallel_size
-        start, end = get_pp_indices(total_num_hidden_layers, pp_rank, pp_size)
+        start, end = get_pp_indices(
+            total_num_hidden_layers,
+            pp_rank,
+            pp_size,
+            partition_config=parallel_config.pipeline_partition_config,
+        )
         return start, end
 
     def get_num_layers(self, parallel_config: ParallelConfig) -> int:

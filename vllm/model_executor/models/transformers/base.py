@@ -424,6 +424,7 @@ class Base(
             self.text_config.num_hidden_layers,
             self.pp_group.rank_in_group,
             self.pp_group.world_size,
+            partition_config=self.parallel_config.pipeline_partition_config,
         )
         layers_name = names[module_list_idx]
         # attrgetter in case the module is nested (e.g. "text_model.layers")
@@ -609,7 +610,12 @@ class Base(
 
         pp_rank = self.pp_group.rank_in_group
         pp_size = self.pp_group.world_size
-        start, end = get_pp_indices(text_config.num_hidden_layers, pp_rank, pp_size)
+        start, end = get_pp_indices(
+            text_config.num_hidden_layers,
+            pp_rank,
+            pp_size,
+            partition_config=self.parallel_config.pipeline_partition_config,
+        )
 
         for i in range(start, end):
             if i not in self.attention_fusers:

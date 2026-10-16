@@ -38,6 +38,7 @@ from vllm.config.offload import (
     UVAOffloadConfig,
 )
 from vllm.config.parallel import EPLBConfig, ParallelConfig
+from vllm.config.pipeline import PipelinePartitionConfig, PipelineTransportConfig
 from vllm.config.pooler import PoolerConfig
 from vllm.config.profiler import ProfilerConfig
 from vllm.config.reasoning import ReasoningConfig
@@ -121,6 +122,9 @@ __all__ = [
     # From vllm.config.parallel
     "EPLBConfig",
     "ParallelConfig",
+    # From vllm.config.pipeline
+    "PipelinePartitionConfig",
+    "PipelineTransportConfig",
     # From vllm.config.pooler
     "PoolerConfig",
     # From vllm.config.reasoning

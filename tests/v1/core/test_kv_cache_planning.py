@@ -1231,6 +1231,84 @@ def test_get_kv_cache_configs_attention_free():
     ]
 
 
+@pytest.mark.parametrize("layout", ["LBNHC", "BLNHC"])
+@pytest.mark.parametrize(
+    "override,auto_fit", [(None, False), (12, False), (None, True)]
+)
+def test_empty_pp_endpoints_preserve_cloud_kv_capacity(layout, override, auto_fit):
+    """Embedding/head ranks neither allocate KV nor constrain cloud admission."""
+    from vllm.v1.worker.utils import allocate_kv_cache, prepare_kernel_block_sizes
+
+    cache_config = CacheConfig(num_gpu_blocks_override=override)
+    cache_config.kv_cache_layout = layout
+    config = SimpleNamespace(
+        cache_config=cache_config,
+        device_config=SimpleNamespace(device_type="cpu"),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=None,
+        num_prefill_lookahead_tokens=0,
+        model_config=SimpleNamespace(
+            original_max_model_len=-1 if auto_fit else 64,
+            max_model_len=512 if auto_fit else 64,
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, decode_context_parallel_size=1
+        ),
+    )
+    spec = new_kv_cache_spec(block_size=16)
+    cloud_specs = {f"layers.{i}": spec for i in range(4)}
+    cloud_memory = 16 * 4 * spec.page_size_bytes
+    configs = get_kv_cache_configs(config, [{}, cloud_specs, {}], [0, cloud_memory, 0])
+
+    assert [cfg.num_blocks for cfg in configs] == [override or 16] * 3
+    assert all(len(cfg.kv_cache_groups) == 1 for cfg in configs)
+    for index in (0, 2):
+        assert configs[index].kv_cache_tensors == []
+        assert configs[index].kv_cache_groups[0].layer_names == []
+        assert prepare_kernel_block_sizes(configs[index], [[]]) == [spec.block_size]
+        assert (
+            allocate_kv_cache(
+                configs[index], torch.device("cpu"), KVCacheLayout[layout]
+            )
+            == {}
+        )
+    assert configs[1].kv_cache_tensors
+    scheduler = generate_scheduler_kv_cache_config(configs)
+    assert scheduler.kv_cache_groups[0].layer_names == list(cloud_specs)
+    assert scheduler.num_blocks == (override or 16)
+    if auto_fit:
+        # The one null block is reserved only on the cloud's real storage.
+        assert config.model_config.max_model_len == 15 * spec.block_size
+
+
+def test_empty_pp_stage_keeps_minimum_of_nonempty_stages():
+    """A zero-layer head must not hide a capacity limit in the tail stage."""
+    cache_config = CacheConfig()
+    cache_config.kv_cache_layout = "LBNHC"
+    config = SimpleNamespace(
+        cache_config=cache_config,
+        attention_config=SimpleNamespace(hisparse_config=None),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=None,
+        num_prefill_lookahead_tokens=0,
+        model_config=SimpleNamespace(original_max_model_len=32, max_model_len=32),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, decode_context_parallel_size=1
+        ),
+    )
+    spec = new_kv_cache_spec(block_size=16)
+    configs = get_kv_cache_configs(
+        config,
+        [{}, {"layers.0": spec, "layers.1": spec}, {"layers.2": spec}],
+        [0, 20 * spec.page_size_bytes, 6 * spec.page_size_bytes],
+    )
+    assert [cfg.num_blocks for cfg in configs] == [6, 6, 6]
+    assert configs[0].kv_cache_tensors == []
+    assert configs[1].kv_cache_tensors[0].size == 12 * spec.page_size_bytes
+    assert configs[2].kv_cache_tensors[0].size == 6 * spec.page_size_bytes
+
+
 def test_packed_groups_glm5_like_hybrid():
     vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=8192))
     vllm_config.cache_config.kv_cache_layout = "BLHNC"

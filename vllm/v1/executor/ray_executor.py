@@ -6,7 +6,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import cloudpickle
 
@@ -30,6 +30,8 @@ from vllm.v1.executor.ray_utils import (
     FutureWrapper,
     RayWorkerWrapper,
     detach_zero_copy_from_model_runner_output,
+    get_bundles_for_pipeline_stages,
+    get_pipeline_stage_node_ips,
     initialize_ray_cluster,
     ray,
 )
@@ -158,6 +160,7 @@ class RayDistributedExecutor(Executor):
 
     def _init_workers_ray(self, placement_group: "PlacementGroup", **ray_remote_kwargs):
         num_gpus = envs.VLLM_RAY_PER_WORKER_GPUS
+        stage_node_ips = get_pipeline_stage_node_ips(self.parallel_config)
 
         # The driver dummy worker does not actually use any resources.
         # It holds the resource for the driver worker.
@@ -182,7 +185,15 @@ class RayDistributedExecutor(Executor):
 
         # Create the workers.
         bundle_indices: list[int]
-        if envs.VLLM_RAY_BUNDLE_INDICES:
+        stage_bundle_assignments: list[tuple[int, str, str]] | None = None
+        if stage_node_ips is not None:
+            stage_bundle_assignments = get_bundles_for_pipeline_stages(
+                placement_group,
+                stage_node_ips,
+                self.parallel_config.tensor_parallel_size,
+            )
+            bundle_indices = [bundle_id for bundle_id, _, _ in stage_bundle_assignments]
+        elif envs.VLLM_RAY_BUNDLE_INDICES:
             # Use the bundle indices specified by the user.
             bundle_indices = list(map(int, envs.VLLM_RAY_BUNDLE_INDICES.split(",")))
             assert len(bundle_indices) == self.parallel_config.world_size, (
@@ -262,9 +273,13 @@ class RayDistributedExecutor(Executor):
         # After sorting, the workers on the same node will be
         # close to each other, and the workers on the driver
         # node will be placed first.
-        sorted_worker_metadata = sorted(
-            worker_metadata, key=sort_by_driver_then_worker_ip
-        )
+        if stage_node_ips is not None:
+            # Preserve stage order: head and tail may be on the same host.
+            sorted_worker_metadata = worker_metadata
+        else:
+            sorted_worker_metadata = sorted(
+                worker_metadata, key=sort_by_driver_then_worker_ip
+            )
         for i, item in enumerate(sorted_worker_metadata):
             item.adjusted_rank = i
         self.workers = [item.worker for item in sorted_worker_metadata]
@@ -282,6 +297,17 @@ class RayDistributedExecutor(Executor):
             worker_node_and_physical_gpu_ids.append(
                 ray.get(worker.get_node_and_physical_gpu_ids.remote())  # type: ignore[attr-defined]
             )
+
+        if stage_bundle_assignments is not None:
+            expected_node_ids = [node_id for _, node_id, _ in stage_bundle_assignments]
+            worker_node_ids = [
+                node_id for node_id, _ in worker_node_and_physical_gpu_ids
+            ]
+            if worker_node_ids != expected_node_ids:
+                raise RuntimeError(
+                    "Ray workers do not match the pipeline stage placement: "
+                    f"expected node IDs {expected_node_ids}, got {worker_node_ids}."
+                )
 
         node_workers = defaultdict(list)  # node id -> list of worker ranks
         node_physical_gpu_ids = defaultdict(list)  # node id -> physical GPU IDs
@@ -301,9 +327,18 @@ class RayDistributedExecutor(Executor):
             ]
             node_physical_gpu_ids[node_id].extend(physical_gpu_ids)
         for node_id, physical_gpu_ids in node_physical_gpu_ids.items():
+            if stage_node_ips is not None and len(set(physical_gpu_ids)) != len(
+                physical_gpu_ids
+            ):
+                raise RuntimeError(
+                    f"Pipeline ranks on node {node_id} were assigned shared devices: "
+                    f"{physical_gpu_ids}. Each rank requires a distinct device."
+                )
             node_physical_gpu_ids[node_id] = sorted(physical_gpu_ids)
 
-        all_ips = set(worker_ips + [driver_ip])
+        all_ips = set(
+            worker_ips if stage_node_ips is not None else worker_ips + [driver_ip]
+        )
         n_ips = len(all_ips)
         n_nodes = len(node_workers)
 
@@ -351,9 +386,17 @@ class RayDistributedExecutor(Executor):
             # solves this issue, as it always works for communication inside
             # the node.
             driver_ip = "127.0.0.1"
-        distributed_init_method = get_distributed_init_method(
-            driver_ip, get_open_port()
-        )
+        if stage_node_ips is not None:
+            rank_zero_worker = cast(ActorHandle, self.workers[0])
+            distributed_init_method = ray.get(
+                rank_zero_worker.create_dist_init_method.remote(
+                    self.parallel_config.world_size
+                )
+            )
+        else:
+            distributed_init_method = get_distributed_init_method(
+                driver_ip, get_open_port()
+            )
 
         # Initialize the actual workers inside worker wrapper.
         all_kwargs = []

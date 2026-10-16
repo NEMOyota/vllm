@@ -32,7 +32,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
-from math import gcd
+from math import gcd, prod
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Protocol
 from unittest.mock import patch
@@ -973,12 +973,17 @@ class GroupCoordinator:
 
         retained = (size_tensor, object_tensor)
         works: list[Any] = []
-        for tensor in retained:
-            work = torch.distributed.isend(
-                tensor, dst=self.ranks[dst], group=self.cpu_group
-            )
-            if work is not None:
-                works.append(work)
+        try:
+            for tensor in retained:
+                work = torch.distributed.isend(
+                    tensor, dst=self.ranks[dst], group=self.cpu_group
+                )
+                if work is not None:
+                    works.append(work)
+        except Exception:
+            # A partial submission does not establish that its buffers are idle.
+            self._retain_failed_transfer(works, list(retained))
+            raise
 
         return _RetainedHandle(works, retained)
 
@@ -1165,6 +1170,8 @@ class GroupCoordinator:
         dst: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        *,
+        retain_tensors: bool = True,
     ) -> list[Handle]:
         """Send the input tensor dictionary asynchronously.
 
@@ -1175,6 +1182,9 @@ class GroupCoordinator:
         sends are still in flight. Callers that do keep the handles may
         ``wait()`` them as before; the retention entry is dropped on reap
         either way.
+
+        With ``retain_tensors=False``, the caller owns and drains every returned
+        handle and keeps the source tensors alive. Used by bounded PP transport.
         """
         if self.world_size <= 1:
             return []
@@ -1207,27 +1217,32 @@ class GroupCoordinator:
 
         # Reap completed sends before posting new ones, bounding the
         # self-retention FIFO.
-        self._reap_completed_isends()
+        if retain_tensors:
+            self._reap_completed_isends()
         handles: list[Handle] = [self.isend_object(metadata_list, dst=dst)]
 
         sent_tensors: list[torch.Tensor] = []
-        for key, tensor in zip(tensor_keys, tensor_list):
-            if tensor.numel() == 0:
-                continue
+        try:
+            for key, tensor in zip(tensor_keys, tensor_list):
+                if tensor.numel() == 0:
+                    continue
 
-            if self._should_use_all_gather(
-                key, tensor.numel(), all_gather_group, all_gather_tensors
-            ):
-                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                if self._should_use_all_gather(
+                    key, tensor.numel(), all_gather_group, all_gather_tensors
+                ):
+                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
-            comm_group = metadata_group if tensor.is_cpu else group
-            handle = torch.distributed.isend(
-                tensor, dst=self.ranks[dst], group=comm_group
-            )
-            if tensor.is_cuda:
-                tensor.record_stream(torch.cuda.current_stream(tensor.device))
-            handles.append(handle)
-            sent_tensors.append(tensor)
+                sent_tensors.append(tensor)
+                comm_group = metadata_group if tensor.is_cpu else group
+                handle = torch.distributed.isend(
+                    tensor, dst=self.ranks[dst], group=comm_group
+                )
+                if tensor.is_cuda:
+                    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+                handles.append(handle)
+        except Exception:
+            self._retain_failed_transfer(handles, sent_tensors)
+            raise
 
         # Self-retain for fire-and-forget callers: keep the handles and
         # the source tensors alive until the sends complete (reaped
@@ -1236,12 +1251,21 @@ class GroupCoordinator:
         # serialized metadata buffers mid-send, and non-CUDA devices
         # have no ``record_stream`` equivalent protecting the tensor
         # sources.
-        pending = getattr(self, "_pending_isends", None)
-        if pending is None:
-            self._pending_isends = pending = deque()
-        pending.append((handles, sent_tensors))
+        if retain_tensors:
+            pending = getattr(self, "_pending_isends", None)
+            if pending is None:
+                self._pending_isends = pending = deque()
+            pending.append((handles, sent_tensors))
 
         return handles
+
+    def _retain_failed_transfer(
+        self, handles: list[Handle], tensors: list[torch.Tensor]
+    ) -> None:
+        retained = getattr(self, "_failed_transfer_buffers", None)
+        if retained is None:
+            self._failed_transfer_buffers = retained = []
+        retained.append((handles, tensors))
 
     def recv_tensor_dict(
         self,
@@ -1286,6 +1310,9 @@ class GroupCoordinator:
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        *,
+        max_recv_bytes: int | None = None,
+        receive_buffer_refs: list[torch.Tensor] | None = None,
     ) -> tuple[
         dict[str, torch.Tensor | Any] | None,
         list[Handle],
@@ -1316,6 +1343,14 @@ class GroupCoordinator:
         metadata_group = self.cpu_group
 
         recv_metadata_list = self.recv_object(src=src)
+        if max_recv_bytes is not None:
+            total_bytes = sum(
+                prod(value.size) * torch.empty((), dtype=value.dtype).element_size()
+                for _, value in recv_metadata_list
+                if isinstance(value, TensorMetadata)
+            )
+            if total_bytes > max_recv_bytes:
+                raise ValueError("Pipeline receive exceeds the in-flight byte limit")
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []
@@ -1325,6 +1360,8 @@ class GroupCoordinator:
                 full_tensor = torch.empty(
                     value.size, dtype=value.dtype, device=value.device
                 )
+                if receive_buffer_refs is not None:
+                    receive_buffer_refs.append(full_tensor)
                 if full_tensor.numel() == 0:
                     tensor_dict[key] = full_tensor
                     continue

@@ -239,3 +239,174 @@ def test_weights_mapper_stacks_one_weight_into_several_shards():
     # Each shard needs its own tensor object, but they alias one allocation.
     assert mapped[0][1] is not mapped[1][1]
     assert mapped[0][1].data_ptr() == mapped[1][1].data_ptr() == weight.data_ptr()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("family", ["llama", "qwen2", "qwen3"])
+@pytest.mark.parametrize("partition", [(0, 4, 0), (1, 2, 1), (0, 3, 1), (1, 3, 0)])
+@pytest.mark.parametrize("tied", [False, True])
+def test_dense_pp_endpoints_match_unsplit_model(
+    monkeypatch, tmp_path, family, partition, tied
+):
+    """Run real model projections/norms/MLPs with CPU SDPA in place of paged KV.
+
+    This exercises prefill chunks and decode after checkpoint weight loading;
+    only the device-specific attention cache kernel and process groups are replaced.
+    """
+    from types import SimpleNamespace
+
+    import torch
+    import torch.nn.functional as F
+    import transformers
+
+    import vllm.distributed.parallel_state as parallel_state
+    from vllm.config import (
+        CompilationConfig,
+        ModelConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.model_executor.models.llama import LlamaForCausalLM
+    from vllm.model_executor.models.qwen2 import Qwen2ForCausalLM
+    from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM
+    from vllm.sequence import IntermediateTensors
+
+    config_cls, model_cls = {
+        "llama": (transformers.LlamaConfig, LlamaForCausalLM),
+        "qwen2": (transformers.Qwen2Config, Qwen2ForCausalLM),
+        "qwen3": (transformers.Qwen3Config, Qwen3ForCausalLM),
+    }[family]
+    config_cls(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=64,
+        tie_word_embeddings=tied,
+        architectures=[model_cls.__name__],
+    ).save_pretrained(tmp_path)
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        parallel_state, "_TP", SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+    cache: dict[Attention, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def attention(layer, q, k, v, **kwargs):
+        q = q.view(-1, layer.num_heads, layer.head_size).transpose(0, 1)
+        k = k.view(-1, layer.num_kv_heads, layer.head_size).transpose(0, 1)
+        v = v.view(-1, layer.num_kv_heads, layer.head_size).transpose(0, 1)
+        previous = cache.get(layer)
+        offset = 0 if previous is None else previous[0].shape[1]
+        if previous is not None:
+            k = torch.cat((previous[0], k), dim=1)
+            v = torch.cat((previous[1], v), dim=1)
+        cache[layer] = k, v
+        mask = torch.arange(k.shape[1])[None, :] <= (
+            offset + torch.arange(q.shape[1])[:, None]
+        )
+        output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        return output.transpose(0, 1).reshape(-1, layer.num_heads * layer.head_size)
+
+    monkeypatch.setattr(Attention, "forward", attention)
+
+    def set_rank(rank, size):
+        monkeypatch.setattr(
+            parallel_state,
+            "_PP",
+            SimpleNamespace(
+                rank_in_group=rank,
+                world_size=size,
+                is_first_rank=rank == 0,
+                is_last_rank=rank == size - 1,
+            ),
+        )
+
+    model_config = ModelConfig(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        enforce_eager=True,
+        dtype="float32",
+        max_model_len=64,
+    )
+
+    def build_model():
+        config = VllmConfig(
+            model_config=model_config,
+            compilation_config=CompilationConfig(custom_ops=["none"]),
+        )
+        with set_current_vllm_config(config):
+            model = model_cls(vllm_config=config)
+        return model, config
+
+    torch.manual_seed(42)
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    set_rank(0, 1)
+    reference, reference_config = build_model()
+    with torch.no_grad():
+        for parameter in reference.parameters():
+            parameter.normal_(std=0.1)
+    checkpoint = [
+        (name, p.detach().clone()) for name, p in reference.named_parameters()
+    ]
+
+    def finalize_weights(model):
+        for module in model.modules():
+            method = getattr(module, "quant_method", None)
+            if method is not None:
+                method.process_weights_after_loading(module)
+
+    finalize_weights(reference)
+
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", ",".join(map(str, partition)))
+    stages = []
+    for rank in range(3):
+        set_rank(rank, 3)
+        stage, config = build_model()
+        # Use the actual PP-aware loader, including tied embedding/head weights.
+        stage.load_weights(iter(checkpoint))
+        finalize_weights(stage)
+        stages.append((stage, config))
+
+    with torch.inference_mode():
+        for tokens in (
+            torch.tensor([1, 4, 8, 3, 2, 7]),
+            torch.tensor([9, 2, 1, 6, 5, 4]),
+        ):
+            cache.clear()
+            offset = 0
+            for chunk_size in (3, 2, 1):
+                input_ids = tokens[offset : offset + chunk_size]
+                positions = torch.arange(offset, offset + chunk_size)
+                set_rank(0, 1)
+                with set_current_vllm_config(reference_config):
+                    expected = reference(input_ids, positions)
+                    expected_logits = reference.compute_logits(expected)
+
+                intermediate = None
+                for rank, (stage, config) in enumerate(stages):
+                    set_rank(rank, 3)
+                    with set_current_vllm_config(config):
+                        result = stage(
+                            input_ids if rank == 0 else None,
+                            positions,
+                            intermediate_tensors=intermediate,
+                        )
+                        if rank == 2:
+                            logits = stage.compute_logits(result)
+                        else:
+                            assert isinstance(result, IntermediateTensors)
+                            assert all(
+                                isinstance(t, torch.Tensor)
+                                for t in result.tensors.values()
+                            )
+                            intermediate = IntermediateTensors(
+                                {key: value.clone() for key, value in result.items()}
+                            )
+                torch.testing.assert_close(
+                    logits, expected_logits, atol=1e-6, rtol=1e-5
+                )
+                offset += chunk_size

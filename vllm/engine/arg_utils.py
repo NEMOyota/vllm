@@ -59,6 +59,8 @@ from vllm.config import (
     ObservabilityConfig,
     OffloadConfig,
     ParallelConfig,
+    PipelinePartitionConfig,
+    PipelineTransportConfig,
     PoolerConfig,
     PrefetchOffloadConfig,
     ProfilerConfig,
@@ -519,8 +521,12 @@ class EngineArgs:
     distributed_executor_backend: (
         str | DistributedExecutorBackend | type[Executor] | None
     ) = ParallelConfig.distributed_executor_backend
-    # number of P/D disaggregation (or other disaggregation) workers
+    # Number of model pipeline stages (not P/D disaggregation workers).
     pipeline_parallel_size: int = ParallelConfig.pipeline_parallel_size
+    pipeline_partition_config: PipelinePartitionConfig | None = None
+    pipeline_transport_config: PipelineTransportConfig = get_field(
+        ParallelConfig, "pipeline_transport_config"
+    )
     master_addr: str = ParallelConfig.master_addr
     master_port: int = ParallelConfig.master_port
     nnodes: int = ParallelConfig.nnodes
@@ -1146,6 +1152,14 @@ class EngineArgs:
             "--pipeline-parallel-size",
             "-pp",
             **parallel_kwargs["pipeline_parallel_size"],
+        )
+        parallel_group.add_argument(
+            "--pipeline-partition-config",
+            **parallel_kwargs["pipeline_partition_config"],
+        )
+        parallel_group.add_argument(
+            "--pipeline-transport-config",
+            **parallel_kwargs["pipeline_transport_config"],
         )
         parallel_group.add_argument("--master-addr", **parallel_kwargs["master_addr"])
         parallel_group.add_argument("--master-port", **parallel_kwargs["master_port"])
@@ -2541,6 +2555,8 @@ class EngineArgs:
 
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
+            pipeline_partition_config=self.pipeline_partition_config,
+            pipeline_transport_config=self.pipeline_transport_config,
             tensor_parallel_size=self.tensor_parallel_size,
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,

@@ -69,6 +69,33 @@ def test_execute_worker_rpc_returns_worker_exception():
     assert str(outputs[0]) == "test error"
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_non_output_pipeline_failure_reaches_worker_monitor(enabled):
+    """A failed head stage must not leave the output stage waiting forever."""
+
+    def fail():
+        raise RuntimeError("pipeline receive failed")
+
+    worker_proc = WorkerProc.__new__(WorkerProc)
+    worker_proc.rank = 0
+    worker_proc.worker = SimpleNamespace(
+        fail=fail,
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                pipeline_transport_config=SimpleNamespace(enabled=enabled)
+            )
+        ),
+    )
+    outputs: list[Any] = []
+    worker_proc.handle_output = outputs.append
+    if enabled:
+        with pytest.raises(RuntimeError, match="pipeline receive failed"):
+            worker_proc._execute_worker_rpc(("fail", (), {}, 2))
+    else:
+        worker_proc._execute_worker_rpc(("fail", (), {}, 2))
+    assert outputs == []
+
+
 @pytest.mark.parametrize("stalled", [False, True])
 @pytest.mark.parametrize(
     "method,result",

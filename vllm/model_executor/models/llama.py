@@ -441,6 +441,9 @@ class LlamaModel(nn.Module, EagleModelMixin):
             )
 
         if not get_pp_group().is_last_rank:
+            if residual is None:
+                # Embedding-only PP stages must return tensor-only intermediates.
+                residual = torch.zeros_like(hidden_states)
             return IntermediateTensors(
                 {
                     "hidden_states": hidden_states,

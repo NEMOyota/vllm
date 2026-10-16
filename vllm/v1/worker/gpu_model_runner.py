@@ -1108,12 +1108,9 @@ class GPUModelRunner(
             scheduler_output: The scheduler output.
 
         """
-        # Attention free models have zero kv_cache_groups, however models
-        # like Mamba are also attention free but use the kv_cache for
-        # keeping its internal state. This is why we check the number
-        # of kv_cache groups instead of solely checking
-        # for self.model_config.is_attention_free.
-        if len(self.kv_cache_config.kv_cache_groups) == 0:
+        # Empty PP endpoints have logical cache groups but no local layers.
+        # Stateful attention-free models such as Mamba still need reordering.
+        if not any(g.layer_names for g in self.kv_cache_config.kv_cache_groups):
             return
 
         if self.reorder_batch_threshold is not None:
@@ -2265,8 +2262,8 @@ class GPUModelRunner(
         tuple[attn_metadata, spec_decode_common_attn_metadata]
 
         """
-        # Attention metadata is not needed for attention free models
-        if len(self.kv_cache_config.kv_cache_groups) == 0:
+        # Empty PP endpoints retain logical cache groups without attention layers.
+        if not any(g.layer_names for g in self.kv_cache_config.kv_cache_groups):
             return {}, None
 
         num_tokens_padded = num_tokens_padded or num_tokens

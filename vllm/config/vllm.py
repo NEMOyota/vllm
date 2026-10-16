@@ -1411,6 +1411,83 @@ class VllmConfig:
         self.engram_config.verify_parallel_config(self.parallel_config)
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
+    def _resolve_pipeline_partition(self) -> None:
+        from vllm.platforms import current_platform
+
+        parallel = self.parallel_config
+        partition = parallel.pipeline_partition_config
+        transport = parallel.pipeline_transport_config
+        if (
+            partition is not None or transport.enabled
+        ) and self.speculative_config is not None:
+            raise ValueError(
+                "Pipeline partition and transport configs do not support "
+                "speculative decoding."
+            )
+        if transport.enabled:
+            if not current_platform.is_cuda_alike():
+                raise ValueError(
+                    "Pipeline transport currently requires a CUDA/ROCm GPU worker."
+                )
+            if not self.use_v2_model_runner:
+                raise ValueError("Pipeline transport requires the V2 model runner.")
+            if (
+                self.kv_transfer_config is not None
+                or self.ec_transfer_config is not None
+                or self.cache_config.kv_offloading_size is not None
+            ):
+                raise ValueError(
+                    "Pipeline transport does not support KV/encoder disaggregation "
+                    "or KV offloading."
+                )
+            if parallel.use_ubatching:
+                raise ValueError(
+                    "Pipeline transport does not support microbatching/DBO."
+                )
+
+        model = self.model_config
+        if partition is None or model is None:
+            return
+        counts = partition.resolve(
+            model.get_total_num_hidden_layers(), parallel.pipeline_parallel_size
+        )
+        logger.info("Resolved pipeline transformer layer counts: %s", counts)
+        if 0 not in counts:
+            return
+
+        supported = {"LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"}
+        if (
+            model.architecture not in supported
+            or model.model_impl not in ("auto", "vllm")
+            or model.runner_type != "generate"
+            or model.is_moe
+            or model.is_hybrid
+            or model.multimodal_config is not None
+        ):
+            raise ValueError(
+                "Zero-transformer pipeline endpoints currently support native dense "
+                "Llama, Qwen2, and Qwen3 text generation models only."
+            )
+        if not model.enforce_eager:
+            raise ValueError(
+                "Zero-transformer pipeline endpoints require --enforce-eager."
+            )
+        if (
+            parallel.data_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or parallel.enable_expert_parallel
+            or parallel.use_ubatching
+            or self.kv_transfer_config is not None
+            or self.ec_transfer_config is not None
+            or self.cache_config.kv_offloading_size is not None
+        ):
+            raise ValueError(
+                "Zero-transformer pipeline endpoints require DP=PCP=DCP=1, "
+                "without expert parallelism, microbatching/DBO, "
+                "KV/encoder disaggregation, or KV offloading."
+            )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
         # To give each torch profile run a unique instance name.
@@ -1423,6 +1500,7 @@ class VllmConfig:
             return
 
         self._resolve_mm_encoder_only()
+        self._resolve_pipeline_partition()
 
         if self.is_mm_encoder_only and self.cache_config.enable_prefix_caching:
             # Such an instance publishes encoder embeddings and runs no language

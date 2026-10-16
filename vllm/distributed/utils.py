@@ -16,7 +16,7 @@ import uuid
 from collections import deque
 from collections.abc import Sequence
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.distributed import ProcessGroup, Store, TCPStore
@@ -34,6 +34,9 @@ from vllm.utils.network_utils import get_tcp_uri
 from vllm.utils.system_utils import suppress_stdout
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.config.pipeline import PipelinePartitionConfig
 
 # We prefer to use os.sched_yield as it results in tighter polling loops,
 # measured to be around 3e-7 seconds. However on earlier versions of Python
@@ -124,7 +127,11 @@ def split_tensor_along_last_dim(
 
 
 def get_pp_indices(
-    num_hidden_layers: int, pp_rank: int, pp_size: int
+    num_hidden_layers: int,
+    pp_rank: int,
+    pp_size: int,
+    *,
+    partition_config: "PipelinePartitionConfig | None" = None,
 ) -> tuple[int, int]:
     """Try to evenly distribute layers across partitions.
 
@@ -139,14 +146,24 @@ def get_pp_indices(
     because they contain the input and output embeddings respectively and we
     are attempting to reduce maximum memory consumption across partitions.
     """
+    if pp_size < 1 or not 0 <= pp_rank < pp_size or num_hidden_layers < 0:
+        raise ValueError("Invalid pipeline size, rank, or layer count.")
     partition_list_str = envs.VLLM_PP_LAYER_PARTITION
-    if partition_list_str is not None:
+    if partition_config is not None:
+        if partition_list_str is not None:
+            raise ValueError(
+                "Use pipeline_partition_config or VLLM_PP_LAYER_PARTITION, not both."
+            )
+        partitions = partition_config.resolve(num_hidden_layers, pp_size)
+    elif partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]
         except ValueError as err:
             raise ValueError(f"Invalid partition string: {partition_list_str}") from err
         if len(partitions) != pp_size:
             raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
+        if any(count < 0 for count in partitions):
+            raise ValueError("Pipeline layer counts must be non-negative.")
         if sum(partitions) != num_hidden_layers:
             raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
     else:

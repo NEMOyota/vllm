@@ -900,12 +900,21 @@ def make_layers(
         Tuple of (start_layer, end_layer, modules).
 
     """
+    from vllm.config import get_current_vllm_config_or_none
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.distributed.utils import get_pp_indices
     from vllm.model_executor.offloader import get_offloader
 
+    vllm_config = get_current_vllm_config_or_none()
     start_layer, end_layer = get_pp_indices(
-        num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
+        num_hidden_layers,
+        get_pp_group().rank_in_group,
+        get_pp_group().world_size,
+        partition_config=(
+            vllm_config.parallel_config.pipeline_partition_config
+            if vllm_config is not None
+            else None
+        ),
     )
 
     modules = torch.nn.ModuleList(

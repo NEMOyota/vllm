@@ -3,12 +3,13 @@
 
 import os
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict, deque
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Union
 
 import numpy as np
 
+import vllm.envs as envs
 import vllm.platforms
 from vllm.config import ParallelConfig
 from vllm.distributed import get_pp_group
@@ -16,7 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.network_utils import get_ip
+from vllm.utils.network_utils import get_distributed_init_method, get_ip
 from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.serial_utils import run_method
 from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -91,6 +92,21 @@ try:
 
         def get_node_ip(self) -> str:
             return get_ip()
+
+        def create_dist_init_method(self, world_size: int) -> str:
+            from torch.distributed import TCPStore
+
+            host = get_ip()
+            store = TCPStore(
+                host_name=host,
+                port=0,
+                world_size=world_size,
+                is_master=True,
+                wait_for_workers=False,
+                multi_tenant=True,
+            )
+            self._dist_init_store = store
+            return get_distributed_init_method(host, store.port)
 
         def get_node_and_physical_gpu_ids(self) -> tuple[str, list[int]]:
             node_id = ray.get_runtime_context().get_node_id()
@@ -442,6 +458,90 @@ def get_bundles_sorted_by_node(
     return bundle_to_node_id
 
 
+def get_pipeline_stage_node_ips(parallel_config: ParallelConfig) -> list[str] | None:
+    partition = getattr(parallel_config, "pipeline_partition_config", None)
+    stage_node_ips = None if partition is None else partition.stage_node_ips
+    if stage_node_ips is not None:
+        if envs.VLLM_RAY_BUNDLE_INDICES:
+            raise ValueError(
+                "pipeline_partition_config.stage_node_ips cannot be combined with "
+                "VLLM_RAY_BUNDLE_INDICES."
+            )
+        if envs.VLLM_RAY_PER_WORKER_GPUS != 1:
+            raise ValueError(
+                "pipeline_partition_config.stage_node_ips requires "
+                "VLLM_RAY_PER_WORKER_GPUS=1 so pipeline ranks use distinct devices."
+            )
+    return stage_node_ips
+
+
+def _pipeline_nodes_by_ip(stage_node_ips: list[str]) -> dict[str, str]:
+    nodes_by_ip: dict[str, str] = {}
+    for node in ray.nodes():
+        ip = node["NodeManagerAddress"]
+        if not node["Alive"] or ip not in stage_node_ips:
+            continue
+        if ip in nodes_by_ip:
+            raise ValueError(f"Multiple live Ray nodes have stage node IP {ip}.")
+        nodes_by_ip[ip] = node["NodeID"]
+    missing = set(stage_node_ips) - nodes_by_ip.keys()
+    if missing:
+        raise ValueError(
+            "Pipeline stage nodes are not alive in the Ray cluster: "
+            f"{sorted(missing)}. "
+            "stage_node_ips must match Ray NodeManagerAddress values."
+        )
+    return nodes_by_ip
+
+
+def _create_pipeline_placement_group_specs(
+    stage_node_ips: list[str], tp_size: int, device_str: str
+) -> list[dict[str, float]]:
+    nodes_by_ip = _pipeline_nodes_by_ip(stage_node_ips)
+    available = available_resources_per_node()
+    for ip, stage_count in Counter(stage_node_ips).items():
+        required = stage_count * tp_size
+        count = available.get(nodes_by_ip[ip], {}).get(device_str, 0)
+        if count < required:
+            raise ValueError(
+                f"Pipeline stages on {ip} require {required} distinct {device_str}s "
+                f"({stage_count} stages x TP={tp_size}), "
+                f"but only {count} are available."
+            )
+    return [
+        {device_str: 1.0, f"node:{ip}": 0.001}
+        for ip in stage_node_ips
+        for _ in range(tp_size)
+    ]
+
+
+def get_bundles_for_pipeline_stages(
+    placement_group: "PlacementGroup", stage_node_ips: list[str], tp_size: int
+) -> list[tuple[int, str, str]]:
+    """Assign distinct bundles in PP/TP order, including repeated stage hosts."""
+    nodes_by_ip = _pipeline_nodes_by_ip(stage_node_ips)
+    bundle_to_node = placement_group_table(placement_group)["bundles_to_node_id"]
+    device_str = current_platform.ray_device_key
+    bundles_by_node: dict[str, deque[int]] = defaultdict(deque)
+    for bundle_id, bundle in enumerate(placement_group.bundle_specs):
+        if bundle.get(device_str, 0) == 1:
+            node_id = bundle_to_node.get(bundle_id)
+            if node_id is not None:
+                bundles_by_node[node_id].append(bundle_id)
+    assignments: list[tuple[int, str, str]] = []
+    for stage, ip in enumerate(stage_node_ips):
+        node_id = nodes_by_ip[ip]
+        bundles = bundles_by_node[node_id]
+        if len(bundles) < tp_size:
+            raise ValueError(
+                f"Placement group has insufficient distinct {device_str} bundles "
+                f"on {ip} for pipeline stage {stage}: need {tp_size}, "
+                f"have {len(bundles)} remaining."
+            )
+        assignments.extend((bundles.popleft(), node_id, ip) for _ in range(tp_size))
+    return assignments
+
+
 def _wait_until_pg_ready(current_placement_group: "PlacementGroup"):
     """Wait until a placement group is ready.
 
@@ -531,6 +631,10 @@ def initialize_ray_cluster(
     assert_ray_available()
     from vllm.platforms import current_platform
 
+    stage_node_ips = get_pipeline_stage_node_ips(parallel_config)
+    if stage_node_ips is not None:
+        require_gpu_on_driver = False
+
     # Disable Ray usage stats collection
     if os.environ.get("RAY_USAGE_STATS_ENABLED", "0") != "1":
         os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
@@ -617,19 +721,24 @@ def initialize_ray_cluster(
                 device_str,
             )
         # Create a new placement group
-        placement_group_specs: list[dict[str, float]] = [
-            {device_str: 1.0} for _ in range(parallel_config.world_size)
-        ]
+        if stage_node_ips is not None:
+            placement_group_specs = _create_pipeline_placement_group_specs(
+                stage_node_ips, parallel_config.tensor_parallel_size, device_str
+            )
+        else:
+            placement_group_specs = [
+                {device_str: 1.0} for _ in range(parallel_config.world_size)
+            ]
 
         # vLLM engine is also a worker to execute model with an accelerator,
         # so it requires to have the device in a current node. Check if
         # the current node has at least one device.
-        current_ip = get_ip()
-        current_node_id = ray.get_runtime_context().get_node_id()
-        current_node_resource = available_resources_per_node()[current_node_id]
         # TODO (jeffreywang): require_gpu_on_driver should be always False
         # after deprecating RayDistributedExecutor.
         if require_gpu_on_driver:
+            current_ip = get_ip()
+            current_node_id = ray.get_runtime_context().get_node_id()
+            current_node_resource = available_resources_per_node()[current_node_id]
             if current_node_resource.get(device_str, 0) < 1:
                 raise ValueError(
                     f"Current node has no {device_str} available. "
@@ -652,5 +761,11 @@ def initialize_ray_cluster(
     _verify_bundles(
         current_placement_group, parallel_config, device_str, require_gpu_on_driver
     )
+    if stage_node_ips is not None:
+        get_bundles_for_pipeline_stages(
+            current_placement_group,
+            stage_node_ips,
+            parallel_config.tensor_parallel_size,
+        )
     # Set the placement group in the parallel config
     parallel_config.placement_group = current_placement_group
